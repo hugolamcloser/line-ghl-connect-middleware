@@ -21,6 +21,8 @@ const envSchema = z.object({
   GHL_LOCATION_ID: z.string().default(""),
   GHL_CUSTOM_PROVIDER_ID: z.string().default(""),
   GHL_CUSTOM_PROVIDER_SECRET: z.string().default(""),
+  GHL_LINE_USER_ID_FIELD_ID: z.string().default(""),
+  GHL_LINE_DISPLAY_NAME_FIELD_ID: z.string().default(""),
 
   WEBHOOK_SHARED_SECRET: z.string().default("")
 });
