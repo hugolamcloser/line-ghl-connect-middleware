@@ -6,7 +6,7 @@ import type {
   GhlInboundMessageInput,
   GhlInboundMessageResponse
 } from "../types/ghl";
-import { redactSecrets } from "../utils/redaction";
+import { redactSecrets, redactSensitiveText } from "../utils/redaction";
 import { forceRefreshGhlAuthContext, getGhlAuthContext, type GhlAuthContext } from "../services/ghlOAuthService";
 
 export class GhlApiError extends Error {
@@ -37,6 +37,9 @@ export class GhlApiError extends Error {
   }
 }
 
+const providerNoAccessCanonicalCode = "CONVERSATIONS_MSG_PROVIDER_NO_ACCESS";
+let providerConfigWarningLogged = false;
+
 function getString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
@@ -55,6 +58,32 @@ function normalizeDisplayName(input: GhlCreateContactInput): string {
   }
 
   return `LINE User ${input.lineUserId.slice(-8)}`;
+}
+
+function idsEqual(left: string | undefined, right: string | undefined): boolean {
+  return Boolean(left?.trim() && right?.trim() && left.trim() === right.trim());
+}
+
+function getProviderIdEqualsOAuthClientId(): boolean {
+  return idsEqual(env.GHL_CUSTOM_PROVIDER_ID, env.GHL_OAUTH_CLIENT_ID);
+}
+
+function getConfiguredConversationProviderId(): string {
+  const conversationProviderId = requireEnvValue("GHL_CUSTOM_PROVIDER_ID", env.GHL_CUSTOM_PROVIDER_ID);
+
+  if (getProviderIdEqualsOAuthClientId() && !providerConfigWarningLogged) {
+    providerConfigWarningLogged = true;
+    logger.warn(
+      {
+        conversationProviderId,
+        locationId: env.GHL_LOCATION_ID,
+        providerIdEqualsOAuthClientId: true
+      },
+      "GHL_CUSTOM_PROVIDER_ID equals GHL_OAUTH_CLIENT_ID; this is likely the Marketplace OAuth client/app id, not the custom Conversation Provider id"
+    );
+  }
+
+  return conversationProviderId;
 }
 
 function splitDisplayName(displayName: string): { firstName: string; lastName?: string } {
@@ -126,6 +155,79 @@ function buildLineContactMetadataPayload(input: GhlCreateContactInput, existingT
   };
 }
 
+function parseResponseBody(responseText: string): unknown {
+  if (!responseText) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    return responseText;
+  }
+}
+
+function getNestedString(payload: unknown, ...path: string[]): string | undefined {
+  let current = payload;
+
+  for (const key of path) {
+    const record = getRecord(current);
+
+    if (!record || !(key in record)) {
+      return undefined;
+    }
+
+    current = record[key];
+  }
+
+  return getString(current);
+}
+
+function getGhlErrorDetails(responseBody: unknown): { canonicalCode?: string; message?: string } {
+  return {
+    canonicalCode:
+      getNestedString(responseBody, "canonicalCode") ??
+      getNestedString(responseBody, "error", "canonicalCode") ??
+      getNestedString(responseBody, "meta", "canonicalCode"),
+    message:
+      getNestedString(responseBody, "message") ??
+      getNestedString(responseBody, "error", "message") ??
+      getNestedString(responseBody, "msg")
+  };
+}
+
+function buildInboundMessagePayload(input: GhlInboundMessageInput) {
+  const conversationProviderId = getConfiguredConversationProviderId();
+  return {
+    locationId: requireEnvValue("GHL_LOCATION_ID", env.GHL_LOCATION_ID),
+    contactId: input.contactId,
+    conversationId: input.conversationId,
+    conversationProviderId,
+    providerId: conversationProviderId,
+    externalConversationId: input.externalConversationId,
+    externalMessageId: input.externalMessageId,
+    direction: "inbound",
+    type: "CUSTOM",
+    message: input.message,
+    attachments: input.attachments ?? []
+  };
+}
+
+function buildProviderProbePayload(conversationProviderId: string, locationId: string) {
+  return {
+    locationId,
+    contactId: "debug-provider-access-test-contact",
+    conversationProviderId,
+    providerId: conversationProviderId,
+    externalConversationId: `debug-provider-test:${locationId}:${conversationProviderId}`,
+    externalMessageId: `debug-provider-test:${Date.now()}`,
+    direction: "inbound",
+    type: "CUSTOM",
+    message: "Provider access probe. This should fail before creating a real message.",
+    attachments: []
+  };
+}
+
 async function performGhlRequest(
   path: string,
   init: RequestInit | undefined,
@@ -143,7 +245,11 @@ async function performGhlRequest(
   });
 }
 
-async function ghlRequest<T>(path: string, init?: RequestInit, requestPayload?: unknown): Promise<T> {
+async function ghlRequestWithResult<T>(
+  path: string,
+  init?: RequestInit,
+  requestPayload?: unknown
+): Promise<{ data: T; statusCode: number; responseBody: unknown; authMode: string }> {
   const method = init?.method ?? "GET";
   const locationId = requireEnvValue("GHL_LOCATION_ID", env.GHL_LOCATION_ID);
   let auth = await getGhlAuthContext(locationId);
@@ -167,12 +273,14 @@ async function ghlRequest<T>(path: string, init?: RequestInit, requestPayload?: 
   }
 
   const responseText = await response.text();
+  const redactedResponseText = redactSensitiveText(responseText);
+  const redactedResponseBody = redactSecrets(parseResponseBody(redactedResponseText));
 
   if (!response.ok) {
     throw new GhlApiError({
-      message: `HighLevel API ${response.status} ${response.statusText}: ${responseText}`,
+      message: `HighLevel API ${response.status} ${response.statusText}: ${redactedResponseText}`,
       statusCode: response.status,
-      responseBody: responseText,
+      responseBody: redactedResponseText,
       requestPayload,
       path,
       method,
@@ -181,10 +289,24 @@ async function ghlRequest<T>(path: string, init?: RequestInit, requestPayload?: 
   }
 
   if (!responseText) {
-    return undefined as T;
+    return {
+      data: undefined as T,
+      statusCode: response.status,
+      responseBody: undefined,
+      authMode: auth.mode
+    };
   }
 
-  return JSON.parse(responseText) as T;
+  return {
+    data: JSON.parse(responseText) as T,
+    statusCode: response.status,
+    responseBody: redactedResponseBody,
+    authMode: auth.mode
+  };
+}
+
+async function ghlRequest<T>(path: string, init?: RequestInit, requestPayload?: unknown): Promise<T> {
+  return (await ghlRequestWithResult<T>(path, init, requestPayload)).data;
 }
 
 export async function createGhlContact(input: GhlCreateContactInput): Promise<GhlContactResponse> {
@@ -195,7 +317,7 @@ export async function createGhlContact(input: GhlCreateContactInput): Promise<Gh
     name: displayName,
     firstName: nameParts.firstName,
     lastName: nameParts.lastName,
-    ...buildLineContactMetadataPayload(input)
+    source: "LINE Official Account"
   };
 
   const response = await ghlRequest<Record<string, unknown>>("/contacts/", {
@@ -242,24 +364,62 @@ export async function updateGhlContactLineFields(contactId: string, input: GhlCr
 }
 
 export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Promise<GhlInboundMessageResponse> {
-  const payload = {
-    locationId: requireEnvValue("GHL_LOCATION_ID", env.GHL_LOCATION_ID),
-    contactId: input.contactId,
-    conversationId: input.conversationId,
-    conversationProviderId: requireEnvValue("GHL_CUSTOM_PROVIDER_ID", env.GHL_CUSTOM_PROVIDER_ID),
-    providerId: requireEnvValue("GHL_CUSTOM_PROVIDER_ID", env.GHL_CUSTOM_PROVIDER_ID),
-    externalConversationId: input.externalConversationId,
-    externalMessageId: input.externalMessageId,
-    direction: "inbound",
-    type: "CUSTOM",
-    message: input.message,
-    attachments: input.attachments ?? []
-  };
+  const path = "/conversations/messages/inbound";
+  const method = "POST";
+  const payload = buildInboundMessagePayload(input);
 
-  return ghlRequest<GhlInboundMessageResponse>("/conversations/messages/inbound", {
-    method: "POST",
-    body: JSON.stringify(payload)
-  }, payload);
+  logger.info(
+    {
+      method,
+      path,
+      conversationProviderId: payload.conversationProviderId,
+      providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
+      locationId: payload.locationId,
+      requestBody: redactSecrets(payload)
+    },
+    "Sending HighLevel inbound conversation provider message"
+  );
+
+  try {
+    const response = await ghlRequestWithResult<GhlInboundMessageResponse>(path, {
+      method,
+      body: JSON.stringify(payload)
+    }, payload);
+
+    logger.info(
+      {
+        method,
+        path,
+        conversationProviderId: payload.conversationProviderId,
+        locationId: payload.locationId,
+        statusCode: response.statusCode,
+        responseBody: response.responseBody,
+        authMode: response.authMode
+      },
+      "HighLevel inbound conversation provider message accepted"
+    );
+
+    return response.data;
+  } catch (error) {
+    if (error instanceof GhlApiError) {
+      logger.error(
+        {
+          method,
+          path,
+          conversationProviderId: payload.conversationProviderId,
+          providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
+          locationId: payload.locationId,
+          requestBody: redactSecrets(payload),
+          statusCode: error.statusCode,
+          responseBody: error.responseBody,
+          authMode: error.authMode
+        },
+        "HighLevel inbound conversation provider message failed"
+      );
+    }
+
+    throw error;
+  }
 }
 
 export async function testGhlOAuthToken(): Promise<{
@@ -303,6 +463,120 @@ export async function testGhlOAuthToken(): Promise<{
       ok: false,
       endpoint,
       authMode: "oauth",
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+export async function getGhlProviderConfigDebug(): Promise<{
+  GHL_CUSTOM_PROVIDER_ID: string;
+  provider_id_equals_oauth_client_id: boolean;
+  GHL_LOCATION_ID: string;
+  oauth_token_present: boolean;
+  selected_auth_mode: "oauth" | "private_integration" | "none";
+}> {
+  const locationId = requireEnvValue("GHL_LOCATION_ID", env.GHL_LOCATION_ID);
+  const providerId = requireEnvValue("GHL_CUSTOM_PROVIDER_ID", env.GHL_CUSTOM_PROVIDER_ID);
+  let selectedAuthMode: "oauth" | "private_integration" | "none" = "none";
+  let oauthTokenPresent = false;
+
+  try {
+    await getGhlAuthContext(locationId, { allowPrivateFallback: false });
+    oauthTokenPresent = true;
+  } catch {
+    oauthTokenPresent = false;
+  }
+
+  try {
+    selectedAuthMode = (await getGhlAuthContext(locationId)).mode;
+  } catch {
+    selectedAuthMode = "none";
+  }
+
+  return {
+    GHL_CUSTOM_PROVIDER_ID: providerId,
+    provider_id_equals_oauth_client_id: getProviderIdEqualsOAuthClientId(),
+    GHL_LOCATION_ID: locationId,
+    oauth_token_present: oauthTokenPresent,
+    selected_auth_mode: selectedAuthMode
+  };
+}
+
+export async function testGhlConversationProviderAccess(): Promise<{
+  provider_access_ok: boolean;
+  endpoint: string;
+  method: string;
+  authMode: string;
+  GHL_CUSTOM_PROVIDER_ID: string;
+  provider_id_equals_oauth_client_id: boolean;
+  GHL_LOCATION_ID: string;
+  statusCode?: number;
+  canonicalCode?: string;
+  message?: string;
+  responseBody?: unknown;
+  error?: string;
+}> {
+  const locationId = requireEnvValue("GHL_LOCATION_ID", env.GHL_LOCATION_ID);
+  const conversationProviderId = getConfiguredConversationProviderId();
+  const endpoint = "/conversations/messages/inbound";
+  const method = "POST";
+  const payload = buildProviderProbePayload(conversationProviderId, locationId);
+
+  try {
+    let auth = await getGhlAuthContext(locationId, { allowPrivateFallback: false });
+    let response = await performGhlRequest(endpoint, { method, body: JSON.stringify(payload) }, auth);
+
+    if (response.status === 401 && auth.mode === "oauth") {
+      auth = await forceRefreshGhlAuthContext(locationId);
+      response = await performGhlRequest(endpoint, { method, body: JSON.stringify(payload) }, auth);
+    }
+
+    const responseText = redactSensitiveText(await response.text());
+    const responseBody = redactSecrets(parseResponseBody(responseText));
+    const { canonicalCode, message } = getGhlErrorDetails(responseBody);
+    const lowerMessage = message?.toLowerCase();
+    const providerAccessDenied =
+      canonicalCode === providerNoAccessCanonicalCode ||
+      Boolean(lowerMessage?.includes("conversationprovider") && lowerMessage.includes("access"));
+
+    logger.info(
+      {
+        method,
+        endpoint,
+        conversationProviderId,
+        providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
+        locationId,
+        statusCode: response.status,
+        responseBody,
+        canonicalCode,
+        message
+      },
+      "HighLevel conversation provider access test completed"
+    );
+
+    return {
+      provider_access_ok:
+        response.ok || (!providerAccessDenied && response.status !== 401 && response.status !== 403 && response.status !== 404),
+      endpoint,
+      method,
+      authMode: auth.mode,
+      GHL_CUSTOM_PROVIDER_ID: conversationProviderId,
+      provider_id_equals_oauth_client_id: getProviderIdEqualsOAuthClientId(),
+      GHL_LOCATION_ID: locationId,
+      statusCode: response.status,
+      canonicalCode,
+      message,
+      responseBody
+    };
+  } catch (error) {
+    return {
+      provider_access_ok: false,
+      endpoint,
+      method,
+      authMode: "oauth",
+      GHL_CUSTOM_PROVIDER_ID: conversationProviderId,
+      provider_id_equals_oauth_client_id: getProviderIdEqualsOAuthClientId(),
+      GHL_LOCATION_ID: locationId,
       error: error instanceof Error ? error.message : String(error)
     };
   }
