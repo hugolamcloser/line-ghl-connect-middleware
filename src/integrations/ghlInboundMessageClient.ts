@@ -4,6 +4,7 @@ import { forceRefreshGhlAuthContext, getGhlAuthContext, type GhlAuthContext } fr
 import type { GhlInboundMessageInput, GhlInboundMessageResponse } from "../types/ghl";
 import { redactSecrets, redactSensitiveText } from "../utils/redaction";
 import { GhlApiError } from "./ghlClient";
+import { getConfiguredLocationApiAuthMode, getEffectiveInboundSendAuthMode } from "./ghlLocationClient";
 
 type GhlInboundSendAuthMode = "oauth" | "private_integration";
 type GhlResolvedAuthMode = GhlAuthContext["mode"];
@@ -22,10 +23,15 @@ type InboundMessagePayload = {
 };
 
 type InboundSendDiagnostics = {
+  contact_auth_mode_used: GhlInboundSendAuthMode;
+  inbound_send_auth_mode_used: GhlResolvedAuthMode;
   configured_auth_mode: GhlInboundSendAuthMode;
   actual_auth_mode_used: GhlResolvedAuthMode;
+  used_private_integration_token_for_contact: boolean;
+  used_private_integration_token_for_inbound_send: boolean;
   used_private_integration_token: boolean;
   used_oauth_token: boolean;
+  contact_step: "send_message";
   endpoint: string;
   method: string;
   providerId: string;
@@ -168,7 +174,7 @@ function getPrivateIntegrationAuthContext(locationId: string): GhlAuthContext {
 }
 
 async function getInboundSendAuthContext(locationId: string): Promise<GhlAuthContext> {
-  if (getConfiguredInboundSendAuthMode() === "private_integration") {
+  if (getEffectiveInboundSendAuthMode() === "private_integration") {
     return getPrivateIntegrationAuthContext(locationId);
   }
 
@@ -298,10 +304,15 @@ function buildInboundSendDiagnostics(input: {
   responseBody?: unknown;
 }): InboundSendDiagnostics {
   return {
+    contact_auth_mode_used: getConfiguredLocationApiAuthMode(),
+    inbound_send_auth_mode_used: input.authMode,
     configured_auth_mode: input.configuredAuthMode,
     actual_auth_mode_used: input.authMode,
+    used_private_integration_token_for_contact: getConfiguredLocationApiAuthMode() === "private_integration",
+    used_private_integration_token_for_inbound_send: input.authMode === "private_integration",
     used_private_integration_token: input.authMode === "private_integration",
     used_oauth_token: input.authMode === "oauth",
+    contact_step: "send_message",
     endpoint: input.path,
     method: input.method,
     providerId: input.payload.conversationProviderId,
@@ -345,10 +356,11 @@ async function executeConfiguredInboundMessageRequest(input: {
   payload: InboundMessagePayload;
 }): Promise<InboundRequestResult> {
   const configuredAuthMode = getConfiguredInboundSendAuthMode();
+  const effectiveAuthMode = getEffectiveInboundSendAuthMode();
   let auth = await getInboundSendAuthContext(input.payload.locationId);
 
   assertConfiguredInboundSendAuth({
-    configuredAuthMode,
+    configuredAuthMode: effectiveAuthMode,
     auth,
     path: input.path,
     method: input.method,
@@ -367,6 +379,8 @@ async function executeConfiguredInboundMessageRequest(input: {
         path: input.path,
         authMode: auth.mode,
         configuredAuthMode,
+        effectiveAuthMode,
+        locationApiAuthMode: getConfiguredLocationApiAuthMode(),
         conversationProviderId: input.payload.conversationProviderId,
         locationId: input.payload.locationId,
         contactId: input.payload.contactId,
@@ -378,7 +392,7 @@ async function executeConfiguredInboundMessageRequest(input: {
 
     auth = await forceRefreshGhlAuthContext(input.payload.locationId);
     assertConfiguredInboundSendAuth({
-      configuredAuthMode,
+      configuredAuthMode: effectiveAuthMode,
       auth,
       path: input.path,
       method: input.method,
@@ -424,12 +438,15 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
   const method = "POST";
   const payload = buildInboundMessagePayload(input);
   const configuredAuthMode = getConfiguredInboundSendAuthMode();
+  const effectiveAuthMode = getEffectiveInboundSendAuthMode();
 
   logger.info(
     {
       method,
       path,
       configuredAuthMode,
+      effectiveAuthMode,
+      locationApiAuthMode: getConfiguredLocationApiAuthMode(),
       conversationProviderId: payload.conversationProviderId,
       providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
       locationId: payload.locationId,
@@ -449,6 +466,8 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
         path,
         authMode: result.authMode,
         configuredAuthMode: result.configuredAuthMode,
+        effectiveAuthMode,
+        locationApiAuthMode: getConfiguredLocationApiAuthMode(),
         conversationProviderId: payload.conversationProviderId,
         providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
         locationId: payload.locationId,
@@ -502,6 +521,8 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
           path,
           authMode: error.authMode,
           configuredAuthMode,
+          effectiveAuthMode,
+          locationApiAuthMode: getConfiguredLocationApiAuthMode(),
           conversationProviderId: payload.conversationProviderId,
           providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
           locationId: payload.locationId,
@@ -522,6 +543,8 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
           path,
           authMode: error.authMode,
           configuredAuthMode,
+          effectiveAuthMode,
+          locationApiAuthMode: getConfiguredLocationApiAuthMode(),
           conversationProviderId: payload.conversationProviderId,
           providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
           locationId: payload.locationId,
@@ -539,6 +562,8 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
           method,
           path,
           configuredAuthMode,
+          effectiveAuthMode,
+          locationApiAuthMode: getConfiguredLocationApiAuthMode(),
           conversationProviderId: payload.conversationProviderId,
           providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
           locationId: payload.locationId,
@@ -579,14 +604,17 @@ export async function testConfiguredGhlInboundSendAuth(): Promise<{
   const endpoint = "/conversations/messages/inbound";
   const method = "POST";
   const configuredAuthMode = getConfiguredInboundSendAuthMode();
+  const effectiveAuthMode = getEffectiveInboundSendAuthMode();
   const payload = buildProviderProbePayload(conversationProviderId, locationId);
-  let authMode: string = configuredAuthMode;
+  let authMode: string = effectiveAuthMode;
 
   logger.info(
     {
       method,
       endpoint,
       configuredAuthMode,
+      effectiveAuthMode,
+      locationApiAuthMode: getConfiguredLocationApiAuthMode(),
       conversationProviderId,
       providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
       locationId,
@@ -615,6 +643,8 @@ export async function testConfiguredGhlInboundSendAuth(): Promise<{
         endpoint,
         authMode,
         configuredAuthMode: result.configuredAuthMode,
+        effectiveAuthMode,
+        locationApiAuthMode: getConfiguredLocationApiAuthMode(),
         conversationProviderId,
         providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
         locationId,
@@ -658,6 +688,8 @@ export async function testConfiguredGhlInboundSendAuth(): Promise<{
         endpoint,
         authMode,
         configuredAuthMode,
+        effectiveAuthMode,
+        locationApiAuthMode: getConfiguredLocationApiAuthMode(),
         conversationProviderId,
         providerIdEqualsOAuthClientId: getProviderIdEqualsOAuthClientId(),
         locationId,

@@ -9,6 +9,11 @@ import {
 } from "../integrations/ghlClient";
 import { testGhlInboundMessageAuthMatrix } from "../integrations/ghlInboundAuthMatrix";
 import { testConfiguredGhlInboundSendAuth } from "../integrations/ghlInboundMessageClient";
+import {
+  getConfiguredLocationApiAuthMode,
+  getEffectiveInboundSendAuthMode,
+  testGhlContactAuth
+} from "../integrations/ghlLocationClient";
 import { getConfiguredGhlOAuthStatus, getOAuthCallbackConfig } from "../services/ghlOAuthService";
 import { getRecentDebugEvents } from "../services/repository";
 import { redactSecrets } from "../utils/redaction";
@@ -66,7 +71,11 @@ debugRouter.get("/debug/provider-config", async (_req, res, next) => {
 debugRouter.get("/debug/inbound-send-auth-config", (_req, res) => {
   res.json({
     ok: true,
-    config: redactSecrets(getGhlInboundSendAuthConfigDebug())
+    config: redactSecrets({
+      ...getGhlInboundSendAuthConfigDebug(),
+      GHL_LOCATION_API_AUTH_MODE: getConfiguredLocationApiAuthMode(),
+      effective_inbound_send_auth_mode: getEffectiveInboundSendAuthMode()
+    })
   });
 });
 
@@ -108,6 +117,17 @@ debugRouter.get("/debug/ghl-inbound-send-auth-test", async (_req, res, next) => 
     res.json({
       ok: true,
       result: redactSecrets(await testConfiguredGhlInboundSendAuth())
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+debugRouter.get("/debug/ghl-contact-auth-test", async (_req, res, next) => {
+  try {
+    res.json({
+      ok: true,
+      result: redactSecrets(await testGhlContactAuth())
     });
   } catch (error) {
     next(error);

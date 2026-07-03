@@ -1,6 +1,10 @@
 import { logger } from "../config/logger";
-import { createGhlContact, ensureGhlContactLineMetadata } from "../integrations/ghlClient";
 import { sendInboundMessageToGhl } from "../integrations/ghlInboundMessageClient";
+import {
+  createGhlContact,
+  ensureGhlContactLineMetadata,
+  getLineInboundFlowAuthDiagnostics
+} from "../integrations/ghlLocationClient";
 import { getLineProfile } from "../integrations/lineClient";
 import type { LineMessage, LineSource, LineWebhookEvent } from "../types/line";
 import { getErrorMessage, serializeError } from "../utils/errors";
@@ -55,6 +59,26 @@ function getWebhookEventId(event: LineWebhookEvent): string | undefined {
 function appendMessage(parts: string[], message: string | undefined): string | undefined {
   const cleanParts = [...parts, message].filter((part): part is string => Boolean(part?.trim()));
   return cleanParts.length > 0 ? cleanParts.join("; ") : undefined;
+}
+
+function mergeRequestPayloadWithAuthDiagnostics(requestPayload: unknown): unknown {
+  const authDiagnostics = getLineInboundFlowAuthDiagnostics("send_message");
+
+  if (requestPayload && typeof requestPayload === "object" && !Array.isArray(requestPayload)) {
+    return redactSecrets({
+      ...authDiagnostics,
+      ...(requestPayload as Record<string, unknown>)
+    });
+  }
+
+  if (requestPayload) {
+    return redactSecrets({
+      ...authDiagnostics,
+      request_payload: requestPayload
+    });
+  }
+
+  return redactSecrets(authDiagnostics);
 }
 
 export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<{
@@ -214,12 +238,14 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
     } catch (error) {
       const serializedError = redactSecrets(serializeError(error));
       const errorMessage = appendMessage(metadataWarnings, getErrorMessage(error));
+      const requestPayload = mergeRequestPayloadWithAuthDiagnostics(serializedError.requestPayload);
 
       logger.error(
         {
           lineUserId,
           lineMessageId,
           error: serializedError,
+          requestPayload,
           ghlStatusCode: serializedError.statusCode,
           canonicalCode: serializedError.canonicalCode,
           ghlPath: serializedError.path,
@@ -238,13 +264,14 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
         lineUserId,
         payload: {
           lineEvent: event,
-          ghlError: serializedError
+          ghlError: serializedError,
+          diagnostics: requestPayload
         },
         status: "failed",
         errorMessage,
         ghlStatusCode: serializedError.statusCode,
         ghlResponseBody: serializedError.responseBody,
-        requestPayload: serializedError.requestPayload
+        requestPayload
       });
 
       logger.error(

@@ -56,11 +56,12 @@ Important values:
 - `GHL_LOCATION_ID`: HighLevel location ID.
 - `GHL_CUSTOM_PROVIDER_ID`: Your HighLevel custom Conversation Provider ID.
 - `GHL_INBOUND_MESSAGE_TYPE`: HighLevel inbound message `type`. Use `SMS` for an added SMS custom conversation channel, which is the expected LINE setup. Use `Custom` only for an extra Email provider style setup.
+- `GHL_LOCATION_API_AUTH_MODE`: Auth mode for LINE inbound location-level writes: contact create, contact fetch/update, tags, and optional custom fields. Default is `oauth`. Set to `private_integration` when OAuth returns an authClass `401` for contact writes.
 - `GHL_INBOUND_SEND_AUTH_MODE`: Auth mode used only for `POST /conversations/messages/inbound`. Default is `oauth`. Set to `private_integration` only when the auth matrix shows OAuth is authClass-blocked while Private Integration reaches HighLevel validation.
 - `GHL_OAUTH_CLIENT_ID`, `GHL_OAUTH_CLIENT_SECRET`, and `GHL_OAUTH_REDIRECT_URI`: HighLevel Marketplace app OAuth settings. Production LINE to GHL forwarding uses the installed location OAuth token stored in Supabase.
 - `GHL_LINE_USER_ID_FIELD_ID`: Optional GHL custom field ID for storing the LINE user ID.
 - `GHL_LINE_DISPLAY_NAME_FIELD_ID`: Optional GHL custom field ID for storing the LINE display name.
-- `GHL_PRIVATE_INTEGRATION_TOKEN`: Required when `GHL_INBOUND_SEND_AUTH_MODE=private_integration`. Also available as an optional dev fallback only when `GHL_ALLOW_PRIVATE_TOKEN_FALLBACK=true`.
+- `GHL_PRIVATE_INTEGRATION_TOKEN`: Required when `GHL_LOCATION_API_AUTH_MODE=private_integration` or `GHL_INBOUND_SEND_AUTH_MODE=private_integration`. Also available as an optional dev fallback only when `GHL_ALLOW_PRIVATE_TOKEN_FALLBACK=true`.
 - `GHL_CUSTOM_PROVIDER_SECRET`: Optional shared secret for outbound webhooks from HighLevel.
 - `WEBHOOK_SHARED_SECRET`: Optional shared secret for the admin mapping endpoint.
 
@@ -119,6 +120,7 @@ Assuming `PUBLIC_BASE_URL=https://api.win-crm.ai`:
 - Inbound message endpoint test: `https://api.win-crm.ai/debug/ghl-inbound-message-endpoint-test`
 - Inbound send auth config: `https://api.win-crm.ai/debug/inbound-send-auth-config`
 - Configured inbound send auth test: `https://api.win-crm.ai/debug/ghl-inbound-send-auth-test`
+- Contact auth test: `https://api.win-crm.ai/debug/ghl-contact-auth-test`
 - Inbound auth matrix test: `https://api.win-crm.ai/debug/ghl-inbound-message-auth-matrix-test`
 
 The original route names still work:
@@ -153,7 +155,8 @@ LINE signatures are verified against the exact raw UTF-8 body, so do not put mid
 12. Open `/debug/provider-config`; if `provider_id_equals_oauth_client_id` is `true`, `GHL_CUSTOM_PROVIDER_ID` is almost certainly wrong.
 13. Open `/debug/ghl-provider-test` and `/debug/ghl-inbound-message-endpoint-test` to verify the stored OAuth token can access the configured provider ID and inbound endpoint.
 14. If OAuth still returns `This authClass type is not allowed to access this scope`, open `/debug/ghl-inbound-message-auth-matrix-test` to compare Marketplace OAuth against `GHL_PRIVATE_INTEGRATION_TOKEN`.
-15. If the matrix shows OAuth is authClass-blocked and Private Integration reaches validation, set `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, redeploy, and confirm `/debug/ghl-inbound-send-auth-test` reaches validation before testing a real LINE message.
+15. If contact creation fails with an authClass `401`, set `GHL_LOCATION_API_AUTH_MODE=private_integration`, redeploy, and confirm `/debug/ghl-contact-auth-test` can create/update a debug contact.
+16. If the matrix shows OAuth is authClass-blocked and Private Integration reaches validation, set `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, redeploy, and confirm `/debug/ghl-inbound-send-auth-test` reaches validation before testing a real LINE message.
 
 The inbound message client posts to:
 
@@ -161,7 +164,7 @@ The inbound message client posts to:
 POST /conversations/messages/inbound
 ```
 
-with the configured `Version` header. By default, the middleware uses the stored Marketplace OAuth access token for the location. If the OAuth access token is expired or close to expiry, the middleware refreshes it and retries a 401 once. If `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, only this inbound-message call uses `GHL_PRIVATE_INTEGRATION_TOKEN` as the Bearer token. Contact creation/update, OAuth install, and OAuth refresh stay on the existing OAuth path.
+with the configured `Version` header. By default, the middleware uses the stored Marketplace OAuth access token for the location. If the OAuth access token is expired or close to expiry, the middleware refreshes it and retries a 401 once. If `GHL_LOCATION_API_AUTH_MODE=private_integration`, LINE inbound contact create/update/tag/custom-field calls use `GHL_PRIVATE_INTEGRATION_TOKEN`. If either `GHL_LOCATION_API_AUTH_MODE=private_integration` or `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, the real inbound-message send uses the Private Integration token too so the LINE inbound flow does not mix auth classes. OAuth install, OAuth callback, and OAuth refresh/storage stay on the OAuth path.
 
 For an added SMS custom conversation provider, the payload uses `type: "SMS"` and includes `conversationProviderId`. For an extra Email custom provider, HighLevel documents `type: "Custom"` and `conversationProviderId`. Use `GHL_INBOUND_MESSAGE_TYPE` only to match the provider type configured in HighLevel.
 
@@ -169,9 +172,9 @@ If `/debug/oauth-status` shows `token_present: true` and `refresh_token_present:
 
 If HighLevel returns `This authClass type is not allowed to access this scope`, the OAuth token can exist and still be rejected by the inbound-message API. Check that the Marketplace app version installed in the location includes the Conversation Provider module, that the provider was created under that same app/version, that the location has the provider installed under Settings > Conversation Providers, and that `GHL_INBOUND_MESSAGE_TYPE` matches the provider type.
 
-If `/debug/ghl-inbound-message-auth-matrix-test` shows OAuth returns that authClass `401` while Private Integration returns a `400` such as `CONVERSATIONS_CONTACT_NOT_FOUND`, Private Integration reached HighLevel payload validation and can be used for the real inbound send call. Set `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, keep `GHL_INBOUND_MESSAGE_TYPE=SMS`, redeploy, then run `/debug/inbound-send-auth-config` and `/debug/ghl-inbound-send-auth-test` before sending a real LINE message.
+If `/debug/ghl-inbound-message-auth-matrix-test` shows OAuth returns that authClass `401` while Private Integration returns a `400` such as `CONVERSATIONS_CONTACT_NOT_FOUND`, Private Integration reached HighLevel payload validation and can be used for the real inbound send call. Set `GHL_LOCATION_API_AUTH_MODE=private_integration` and `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, keep `GHL_INBOUND_MESSAGE_TYPE=SMS`, redeploy, then run `/debug/ghl-contact-auth-test`, `/debug/inbound-send-auth-config`, and `/debug/ghl-inbound-send-auth-test` before sending a real LINE message.
 
-The Conversation Provider Delivery URL is only for GHL to middleware outbound messages. LINE inbound messages come from the LINE webhook and are then written into GHL through the LeadConnector API using the auth mode selected by `GHL_INBOUND_SEND_AUTH_MODE`. Marketplace webhooks are separate from the Conversation Provider Delivery URL and are not required for this app unless you add separate GHL event-notification features.
+The Conversation Provider Delivery URL is only for GHL to middleware outbound messages. LINE inbound messages come from the LINE webhook and are then written into GHL through the LeadConnector API using the auth modes selected by `GHL_LOCATION_API_AUTH_MODE` and `GHL_INBOUND_SEND_AUTH_MODE`. Marketplace webhooks are separate from the Conversation Provider Delivery URL and are not required for this app unless you add separate GHL event-notification features.
 
 ## Mapping A LINE User To A GHL Contact
 
@@ -231,7 +234,7 @@ Returns the configured `GHL_CUSTOM_PROVIDER_ID`, whether it exactly equals `GHL_
 
 ### `GET /debug/inbound-send-auth-config`
 
-Returns the production inbound send auth setting without secrets: `GHL_INBOUND_SEND_AUTH_MODE`, whether a Private Integration token is present, provider ID, location ID, and inbound message type.
+Returns the production inbound send auth setting without secrets: `GHL_INBOUND_SEND_AUTH_MODE`, `GHL_LOCATION_API_AUTH_MODE`, effective inbound send auth mode, whether a Private Integration token is present, provider ID, location ID, and inbound message type.
 
 ### `GET /debug/ghl-provider-test`
 
@@ -244,6 +247,10 @@ Uses the stored OAuth token, configured `GHL_CUSTOM_PROVIDER_ID`, and configured
 ### `GET /debug/ghl-inbound-send-auth-test`
 
 Uses the same safe fake inbound-message payload as the endpoint test, but sends it with the auth mode configured by `GHL_INBOUND_SEND_AUTH_MODE`. Use this before a real LINE test after switching to `private_integration`. A `400 CONVERSATIONS_CONTACT_NOT_FOUND` is expected with the fake contact ID and usually means the configured auth mode reached HighLevel payload validation.
+
+### `GET /debug/ghl-contact-auth-test`
+
+Creates and updates a safe debug contact using `GHL_LOCATION_API_AUTH_MODE`. It returns the selected auth mode, whether the Private Integration token is present, endpoint, status code, `canonicalCode` when present, redacted HighLevel response body, and a diagnosis. Use this when LINE inbound fails at `/contacts/` before the message send step.
 
 ### `GET /debug/ghl-inbound-message-auth-matrix-test`
 
@@ -363,6 +370,7 @@ GHL_OAUTH_CLIENT_SECRET=...
 GHL_OAUTH_REDIRECT_URI=https://api.win-crm.ai/oauth/callback
 GHL_OAUTH_TOKEN_URL=https://services.leadconnectorhq.com/oauth/token
 GHL_INBOUND_MESSAGE_TYPE=SMS
+GHL_LOCATION_API_AUTH_MODE=oauth
 GHL_INBOUND_SEND_AUTH_MODE=oauth
 GHL_LINE_USER_ID_FIELD_ID=
 GHL_LINE_DISPLAY_NAME_FIELD_ID=
@@ -416,7 +424,8 @@ https://api.win-crm.ai/oauth/callback
 11. Open `https://api.win-crm.ai/debug/ghl-provider-test` and confirm `provider_access_ok` is not failing with `CONVERSATIONS_MSG_PROVIDER_NO_ACCESS`.
 12. Open `https://api.win-crm.ai/debug/ghl-inbound-message-endpoint-test` and read the diagnosis. A `400` caused by the fake contact ID is better than a `401` because it means HighLevel reached request validation.
 13. Open `https://api.win-crm.ai/debug/ghl-inbound-message-auth-matrix-test` only when you need to compare Marketplace OAuth against Private Integration auth for the same inbound-message endpoint.
-14. If the matrix shows OAuth returns authClass `401` and Private Integration returns `400 CONVERSATIONS_CONTACT_NOT_FOUND`, set `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, redeploy, then open `https://api.win-crm.ai/debug/ghl-inbound-send-auth-test`.
+14. If contact creation fails with an authClass `401`, set `GHL_LOCATION_API_AUTH_MODE=private_integration`, redeploy, then open `https://api.win-crm.ai/debug/ghl-contact-auth-test`.
+15. If the matrix shows OAuth returns authClass `401` and Private Integration returns `400 CONVERSATIONS_CONTACT_NOT_FOUND`, set `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, redeploy, then open `https://api.win-crm.ai/debug/ghl-inbound-send-auth-test`.
 
 ### 7. Configure The GHL Conversation Provider
 
@@ -439,15 +448,16 @@ This Delivery URL is for GHL replies going back to LINE. It is not the OAuth cal
 1. Confirm `/debug/env-check` shows all required variables as `present`.
 2. Confirm `/debug/oauth-status` shows a stored token for `GHL_LOCATION_ID`.
 3. Confirm `/debug/ghl-token-test` succeeds.
-4. Open `/debug/inbound-send-auth-config` and confirm the intended `GHL_INBOUND_SEND_AUTH_MODE`.
-5. Open `/debug/ghl-inbound-send-auth-test`. If `private_integration` is selected, a `400 CONVERSATIONS_CONTACT_NOT_FOUND` from the fake contact ID is acceptable and means HighLevel reached payload validation.
-6. Send a text message to the LINE Official Account from a real LINE user.
-7. In Supabase, check that `webhook_events` has the raw LINE event.
-8. Check that `line_profiles` has a row for that `line_user_id` and a `ghl_contact_id`.
-9. Confirm the GHL contact has source `LINE Official Account` if GHL accepted it.
-10. Confirm the GHL contact has tags `line` and `line:{LINE_USER_ID}`.
-11. Confirm the LINE message appears inside the GHL contact conversation thread.
-12. If the message does not appear, open `/debug/recent-events` and inspect `message_events` for `status`, `error_message`, `ghl_status_code`, `ghl_response_body`, and `request_payload`.
+4. Open `/debug/ghl-contact-auth-test` and confirm contact create/update works with the intended `GHL_LOCATION_API_AUTH_MODE`.
+5. Open `/debug/inbound-send-auth-config` and confirm the intended `GHL_INBOUND_SEND_AUTH_MODE`.
+6. Open `/debug/ghl-inbound-send-auth-test`. If `private_integration` is selected, a `400 CONVERSATIONS_CONTACT_NOT_FOUND` from the fake contact ID is acceptable and means HighLevel reached payload validation.
+7. Send a text message to the LINE Official Account from a real LINE user.
+8. In Supabase, check that `webhook_events` has the raw LINE event.
+9. Check that `line_profiles` has a row for that `line_user_id` and a `ghl_contact_id`.
+10. Confirm the GHL contact has source `LINE Official Account` if GHL accepted it.
+11. Confirm the GHL contact has tags `line` and `line:{LINE_USER_ID}`.
+12. Confirm the LINE message appears inside the GHL contact conversation thread.
+13. If the message does not appear, open `/debug/recent-events` and inspect `message_events` for `status`, `error_message`, `ghl_status_code`, `ghl_response_body`, and `request_payload`.
 
 ### 9. Test GHL To LINE
 
@@ -461,10 +471,11 @@ This Delivery URL is for GHL replies going back to LINE. It is not the OAuth cal
 
 - `Invalid LINE signature`: Check `LINE_CHANNEL_SECRET`, confirm the webhook URL is exactly `/webhooks/line/inbound`, and make sure LINE is sending directly to the deployed service.
 - `LINE API 401`: Check `LINE_CHANNEL_ACCESS_TOKEN`.
+- `HighLevel API 401` at `/contacts/`: Open `/debug/ghl-contact-auth-test`. If OAuth returns authClass `401`, set `GHL_LOCATION_API_AUTH_MODE=private_integration`, ensure `GHL_PRIVATE_INTEGRATION_TOKEN` is present, and redeploy.
 - `HighLevel API 401`: Check `/debug/oauth-status` first. If there is no token, install the Marketplace app. If the token exists, open `/debug/ghl-token-test`; the response usually separates token, scope, endpoint, and location problems.
 - `CONVERSATIONS_MSG_PROVIDER_NO_ACCESS`: OAuth is working, but the configured Conversation Provider is not accessible. Check `/debug/provider-config` first. If `provider_id_equals_oauth_client_id` is `true`, replace `GHL_CUSTOM_PROVIDER_ID` with the real custom Conversation Provider ID. If it is `false`, confirm the provider is installed for this GHL location and tied to the current Marketplace app version.
 - `This authClass type is not allowed to access this scope`: OAuth token storage is working, but HighLevel is rejecting the app/provider authorization for the inbound-message API. Open `/debug/ghl-inbound-message-endpoint-test`, confirm `GHL_INBOUND_MESSAGE_TYPE=SMS`, confirm the app has the Conversation Provider Marketplace module and `conversations/message.write`, reinstall the current app version into the location, and verify the provider appears under Settings > Conversation Providers.
-- `/debug/ghl-inbound-message-auth-matrix-test` recommends `private_integration`: OAuth was rejected by auth class, but Private Integration auth reached request validation or success for the same endpoint and payload. Set `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, redeploy, then confirm `/debug/ghl-inbound-send-auth-test` reaches validation before sending a real LINE message.
+- `/debug/ghl-inbound-message-auth-matrix-test` recommends `private_integration`: OAuth was rejected by auth class, but Private Integration auth reached request validation or success for the same endpoint and payload. Set both `GHL_LOCATION_API_AUTH_MODE=private_integration` and `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, redeploy, then confirm `/debug/ghl-contact-auth-test` and `/debug/ghl-inbound-send-auth-test` before sending a real LINE message.
 - `/debug/ghl-inbound-message-auth-matrix-test` shows both auth modes return `401`: Verify the HighLevel Marketplace Conversation Provider module, app install, provider binding, provider ID, and location with GHL support.
 - `/debug/ghl-inbound-message-endpoint-test` returns `400`: This may be expected because the probe uses a fake contact ID. If the diagnosis says payload validation was reached, send a real LINE message and inspect `/debug/recent-events`.
 - `HighLevel create contact response did not include a contact id`: The GHL create-contact response shape changed or the token cannot create contacts. Check the Railway logs and the HighLevel API response.
