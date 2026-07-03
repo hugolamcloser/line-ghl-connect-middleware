@@ -2,59 +2,301 @@
 
 Node.js, Express, TypeScript, and Supabase middleware for syncing LINE Official Account conversations with GoHighLevel Conversations through a custom Conversation Provider.
 
-The important production auth rule: LINE inbound messages are forwarded to GHL with the installed-location Marketplace OAuth access token stored in Supabase. The private integration token is only an optional dev fallback and should not be relied on for production Conversation Provider message APIs.
+The service accepts inbound LINE webhooks, validates the `x-line-signature` HMAC, saves LINE profiles in Supabase, creates or reuses mapped GHL contacts, forwards inbound messages into HighLevel, receives outbound provider webhooks from HighLevel, and pushes replies back to LINE.
 
 ## What Is Included
 
-- Express API with LINE and GHL webhook routes.
-- Raw-body LINE signature validation.
-- Immediate 200 response to LINE, with background message processing.
-- GHL Marketplace OAuth callback, token storage, token refresh, and one retry after 401.
-- Automatic GHL contact creation and LINE profile mapping.
-- Mandatory LINE contact tags: `line` and `line:{LINE_USER_ID}`.
-- Optional GHL custom fields for LINE user ID and LINE display name.
-- Supabase audit tables for webhook and message sync diagnostics.
-- Debug routes that never expose tokens or secrets.
+- Express API with typed route handlers.
+- LINE webhook signature verification using the raw request body.
+- LINE profile lookup and push message support.
+- Automatic GHL contact creation for new LINE users.
+- HighLevel API client for inbound custom provider messages.
+- Outbound HighLevel webhook handler for replies back to LINE.
+- Supabase migration for tenants, LINE profile mappings, message audit logs, and raw webhook audit storage.
+- Admin endpoint for linking a LINE user to a GHL contact/conversation.
+- Dockerfile and production build scripts.
 
 ## Project Structure
 
 ```text
 src/
-  app.ts
-  server.ts
-  config/
-  integrations/
-  middleware/
-  routes/
-  services/
-  types/
+  app.ts                       Express app assembly
+  server.ts                    HTTP server entrypoint
+  config/                      Environment, logger, Supabase client
+  integrations/                LINE and HighLevel API clients
+  middleware/                  JSON/raw body, errors, shared-secret auth
+  routes/                      Health, LINE webhook, GHL webhook, admin routes
+  services/                    Sync logic and Supabase repository helpers
+  types/                       LINE, GHL, and HTTP types
 supabase/
-  migrations/
+  migrations/                  SQL migration files
 ```
 
-## Required URLs
+## Requirements
+
+- Node.js 22 or newer.
+- Supabase project.
+- LINE Official Account Messaging API channel.
+- HighLevel Marketplace app OAuth credentials.
+- HighLevel custom Conversation Provider configured for the target location.
+
+## Environment Setup
+
+Copy `.env.example` to `.env` and fill in the values:
+
+```bash
+cp .env.example .env
+```
+
+Important values:
+
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`: Supabase backend credentials. Use the service role key only on the server.
+- `LINE_CHANNEL_SECRET`: Used to verify LINE webhook signatures.
+- `LINE_CHANNEL_ACCESS_TOKEN`: Used to call LINE profile and push message APIs.
+- `GHL_LOCATION_ID`: HighLevel location ID.
+- `GHL_CUSTOM_PROVIDER_ID`: Your HighLevel custom Conversation Provider ID.
+- `GHL_OAUTH_CLIENT_ID`, `GHL_OAUTH_CLIENT_SECRET`, and `GHL_OAUTH_REDIRECT_URI`: HighLevel Marketplace app OAuth settings. Production LINE to GHL forwarding uses the installed location OAuth token stored in Supabase.
+- `GHL_LINE_USER_ID_FIELD_ID`: Optional GHL custom field ID for storing the LINE user ID.
+- `GHL_LINE_DISPLAY_NAME_FIELD_ID`: Optional GHL custom field ID for storing the LINE display name.
+- `GHL_PRIVATE_INTEGRATION_TOKEN`: Optional dev fallback only when `GHL_ALLOW_PRIVATE_TOKEN_FALLBACK=true`. Do not rely on it for production LINE inbound Conversation Provider message APIs.
+- `GHL_CUSTOM_PROVIDER_SECRET`: Optional shared secret for outbound webhooks from HighLevel.
+- `WEBHOOK_SHARED_SECRET`: Optional shared secret for the admin mapping endpoint.
+
+## Supabase Setup
+
+Apply both migrations in order:
+
+1. `supabase/migrations/202607020001_initial_schema.sql`
+2. `supabase/migrations/202607030001_ghl_oauth_tokens.sql`
+
+Using the Supabase CLI:
+
+```bash
+supabase db push
+```
+
+Or paste each SQL migration into the Supabase SQL editor and run them one at a time.
+
+Seeing `Success. No rows returned` after running the migration is normal because the SQL creates schema objects and does not return table rows. RLS can be enabled on the tables; this backend uses `SUPABASE_SERVICE_ROLE_KEY`, which bypasses RLS for server-side operations. Do not expose `SUPABASE_SERVICE_ROLE_KEY` publicly, in browser code, or in mobile apps.
+
+The OAuth migration creates `ghl_oauth_tokens` for server-side Marketplace install tokens and adds GHL debug columns to `message_events`. Never expose `access_token` or `refresh_token` values from Supabase.
+
+## Install And Build
+
+```bash
+npm install
+npm run build
+```
+
+Run locally:
+
+```bash
+npm run dev
+```
+
+Run the compiled service:
+
+```bash
+npm start
+```
+
+## Webhook URLs
 
 Assuming `PUBLIC_BASE_URL=https://api.win-crm.ai`:
 
 - LINE webhook URL: `https://api.win-crm.ai/webhooks/line/inbound`
-- GHL Conversation Provider Delivery URL: `https://api.win-crm.ai/webhooks/ghl/line/outbound`
-- GHL Marketplace OAuth callback URL: `https://api.win-crm.ai/oauth/callback`
+- HighLevel outbound provider webhook URL: `https://api.win-crm.ai/webhooks/ghl/line/outbound`
+- HighLevel Marketplace OAuth callback URL: `https://api.win-crm.ai/oauth/callback`
 - Health check: `https://api.win-crm.ai/health`
-- Environment check: `https://api.win-crm.ai/debug/env-check`
-- OAuth status: `https://api.win-crm.ai/debug/oauth-status`
+- Safe environment check: `https://api.win-crm.ai/debug/env-check`
+- OAuth token status: `https://api.win-crm.ai/debug/oauth-status`
+- OAuth callback config: `https://api.win-crm.ai/debug/oauth-callback-config`
 - OAuth token test: `https://api.win-crm.ai/debug/ghl-token-test`
-- Recent events: `https://api.win-crm.ai/debug/recent-events`
 
-The original route aliases still work:
+The original route names still work:
 
 - `POST /webhooks/line`
 - `POST /webhooks/ghl/outbound`
 
-## Environment Variables
+## LINE Configuration
 
-Copy `.env.example` to `.env` for local work. In Railway, add real values in the service Variables tab.
+1. Open the LINE Developers Console.
+2. Select your Messaging API channel.
+3. Set the webhook URL to `https://api.win-crm.ai/webhooks/line/inbound`.
+4. Enable webhooks.
+5. Disable auto-reply settings if HighLevel should own replies.
+6. Copy the channel secret and long-lived channel access token into `.env`.
 
-Required:
+LINE signatures are verified against the exact raw UTF-8 body, so do not put middleware or proxies in front of this service that rewrite JSON bodies before they reach Express.
+
+## HighLevel Configuration
+
+1. Create or open the HighLevel Marketplace app for this middleware.
+2. Set the Marketplace app OAuth callback URL to `https://api.win-crm.ai/oauth/callback`.
+3. Add the Marketplace app client ID and client secret to Railway as `GHL_OAUTH_CLIENT_ID` and `GHL_OAUTH_CLIENT_SECRET`.
+4. Install the Marketplace app into the target GHL location so HighLevel redirects to `/oauth/callback?code=...`.
+5. Confirm `GET /debug/oauth-status` shows `token_present: true` for your `GHL_LOCATION_ID`.
+6. Configure a custom Conversation Provider for the target location.
+7. Set the provider Delivery URL to `https://api.win-crm.ai/webhooks/ghl/line/outbound`.
+8. If the provider supports a custom header or secret field, set it to `GHL_CUSTOM_PROVIDER_SECRET`.
+9. Put the provider ID, location ID, OAuth client settings, and API version into `.env`.
+
+The inbound message client posts to:
+
+```text
+POST /conversations/messages/inbound
+```
+
+with the configured `Version` header and the stored Marketplace OAuth access token for the location. If the access token is expired or close to expiry, the middleware refreshes it and retries a 401 once.
+
+The Conversation Provider Delivery URL is only for GHL to middleware outbound messages. LINE inbound messages come from the LINE webhook and are then written into GHL through the LeadConnector API with the installed-location OAuth token. Marketplace webhooks are separate from the Conversation Provider Delivery URL and are not required for this app unless you add separate GHL event-notification features.
+
+## Mapping A LINE User To A GHL Contact
+
+Inbound LINE events create or update a `line_profiles` row. If that LINE user is already linked to a GHL contact, the message is forwarded to that contact. If no mapping exists yet, the middleware creates a new GHL contact using the LINE display name, saves the `line_user_id` to `ghl_contact_id` mapping in Supabase, then forwards the same inbound LINE message into GHL.
+
+Every LINE-backed contact is created or updated with these tags:
+
+- `line`
+- `line:{LINE_USER_ID}`
+
+For example: `line:U93ebe957edac218bfa9b204bc8060446`. The contact source stays `LINE Official Account` when the GHL API accepts that field. Optional LINE custom fields are updated when `GHL_LINE_USER_ID_FIELD_ID` and `GHL_LINE_DISPLAY_NAME_FIELD_ID` are configured.
+
+The admin endpoint remains available as an override tool. Use it when you want to attach a LINE user to an existing GHL contact or conversation:
+
+```bash
+curl -X POST https://api.win-crm.ai/admin/mappings \
+  -H "Content-Type: application/json" \
+  -H "x-webhook-secret: $WEBHOOK_SHARED_SECRET" \
+  -d '{
+    "lineUserId": "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "ghlContactId": "highlevel-contact-id",
+    "ghlConversationId": "optional-existing-conversation-id"
+  }'
+```
+
+Future LINE messages from that user will be forwarded to the linked GHL contact. Future GHL outbound webhooks for that contact or conversation will be pushed back to LINE.
+
+## API Reference
+
+### `GET /health`
+
+Returns service health.
+
+### `GET /debug/env-check`
+
+Returns whether required environment variables are `present` or `missing`. Secret values are never returned.
+
+### `GET /debug/recent-events`
+
+Returns the latest 10 `line_profiles`, latest 10 `message_events`, and latest 10 `webhook_events` rows. Secret values are redacted. `message_events` includes sync status, `error_message`, GHL status code, GHL response body, and redacted request payload when available.
+
+### `GET /debug/oauth-status`
+
+Returns whether a HighLevel OAuth token exists for the configured `GHL_LOCATION_ID`, whether a refresh token exists, `expires_at`, and `expired`. Real token values are never returned.
+
+### `GET /debug/oauth-callback-config`
+
+Returns non-secret OAuth callback settings: token URL, redirect URI, client ID present, client secret present, location ID present, and Supabase credentials present.
+
+### `GET /debug/ghl-token-test`
+
+Uses the stored OAuth access token for `GHL_LOCATION_ID` to call a simple HighLevel location endpoint. Returns success or failure, status code, endpoint, auth mode, and a redacted response body. It does not use or expose private integration tokens.
+
+### `GET /oauth/callback`
+
+HighLevel Marketplace OAuth callback. It accepts the `code` returned after app installation, exchanges it for access and refresh tokens, stores them in Supabase, and returns safe install status without exposing token values.
+
+### `POST /webhooks/line`
+
+Receives LINE webhook events. Requires a valid `x-line-signature` header. The route validates the payload, immediately returns `{ "ok": true, "accepted": true }`, then syncs events to HighLevel in the background.
+
+### `POST /webhooks/line/inbound`
+
+Alias for `POST /webhooks/line`.
+
+### `POST /webhooks/ghl/outbound`
+
+Receives outbound HighLevel custom provider messages. If `GHL_CUSTOM_PROVIDER_SECRET` is configured, include it in either `x-provider-secret` or `x-ghl-secret`.
+
+### `POST /webhooks/ghl/line/outbound`
+
+Alias for `POST /webhooks/ghl/outbound`.
+
+The parser accepts common payload fields:
+
+- `message`, `body`, `text`, `message.body`, or `message.text`
+- `contactId` or `contact.id`
+- `conversationId` or `conversation.id`
+- `messageId`, `id`, or `message.id`
+- `attachments`
+
+### `POST /admin/mappings`
+
+Links a LINE user to a HighLevel contact/conversation. Requires `WEBHOOK_SHARED_SECRET`.
+
+## Hugo Setup Guide
+
+This is the shortest path for deploying Hugo's `api.win-crm.ai` middleware from a fresh account setup.
+
+### Production Launch Checklist
+
+1. Run both Supabase migrations.
+2. Deploy this repository to Railway from the `main` branch.
+3. Add all Railway environment variables from `.env.example` using real values in Railway only.
+4. Connect the custom domain `api.win-crm.ai` in Railway.
+5. Set the GHL Marketplace OAuth callback URL to `https://api.win-crm.ai/oauth/callback`.
+6. Install the GHL Marketplace app into the target location.
+7. Test `GET /health`, `GET /debug/env-check`, `GET /debug/oauth-callback-config`, `GET /debug/oauth-status`, and `GET /debug/ghl-token-test`.
+8. Set the LINE Developers webhook URL to `https://api.win-crm.ai/webhooks/line/inbound`.
+9. Set the GHL Conversation Provider Delivery URL to `https://api.win-crm.ai/webhooks/ghl/line/outbound`.
+10. Send a real LINE message and confirm it appears inside the GHL contact conversation thread.
+11. Reply from GHL and confirm the message is pushed back to LINE.
+
+### 1. Deploy To Railway
+
+1. Deploy the `main` branch in Railway.
+2. In Railway, choose **New Project**.
+3. Choose **Deploy from GitHub repo**.
+4. Select `hugolamcloser/line-ghl-connect-middleware`.
+5. Let Railway detect the Node.js app. The project builds with `npm install` and starts with `npm start`.
+6. Open the Railway service settings and add your custom domain `api.win-crm.ai`.
+7. Keep the generated Railway domain too. It is useful for testing before DNS is ready.
+
+After deployment, test:
+
+```text
+GET https://api.win-crm.ai/health
+GET https://api.win-crm.ai/debug/env-check
+GET https://api.win-crm.ai/debug/oauth-status
+```
+
+### 2. Create The Supabase Project
+
+1. Go to Supabase and create a new project.
+2. Save the project password somewhere safe.
+3. Open **Project Settings** then **API**.
+4. Copy the project URL into `SUPABASE_URL`.
+5. Copy the service role key into `SUPABASE_SERVICE_ROLE_KEY`.
+
+The service role key is powerful. Put it only in Railway environment variables, never in frontend code.
+
+### 3. Run The Supabase SQL Migration
+
+1. Open your Supabase project.
+2. Go to **SQL Editor**.
+3. Open `supabase/migrations/202607020001_initial_schema.sql` from this repo.
+4. Paste the full SQL into Supabase and click **Run**.
+5. Open `supabase/migrations/202607030001_ghl_oauth_tokens.sql`.
+6. Paste the full SQL into Supabase and click **Run**.
+7. `Success. No rows returned` is the expected result for both migrations.
+8. If you clicked **Run and enable RLS**, that is okay for this backend because it uses `SUPABASE_SERVICE_ROLE_KEY`.
+9. Confirm these tables exist: `tenants`, `line_profiles`, `message_events`, `webhook_events`, and `ghl_oauth_tokens`.
+10. Keep `SUPABASE_SERVICE_ROLE_KEY` only in Railway service variables. Never paste it into public docs, frontend code, or client apps.
+
+### 4. Add Railway Environment Variables
+
+Add these variables in Railway under your service's **Variables** tab:
 
 ```text
 NODE_ENV=production
@@ -73,157 +315,118 @@ GHL_OAUTH_CLIENT_ID=...
 GHL_OAUTH_CLIENT_SECRET=...
 GHL_OAUTH_REDIRECT_URI=https://api.win-crm.ai/oauth/callback
 GHL_OAUTH_TOKEN_URL=https://services.leadconnectorhq.com/oauth/token
-```
-
-Optional:
-
-```text
 GHL_LINE_USER_ID_FIELD_ID=
 GHL_LINE_DISPLAY_NAME_FIELD_ID=
-GHL_CUSTOM_PROVIDER_SECRET=...
-WEBHOOK_SHARED_SECRET=...
 GHL_ALLOW_PRIVATE_TOKEN_FALLBACK=false
 GHL_PRIVATE_INTEGRATION_TOKEN=
+GHL_CUSTOM_PROVIDER_SECRET=...
+WEBHOOK_SHARED_SECRET=...
 ```
 
-Keep `GHL_ALLOW_PRIVATE_TOKEN_FALLBACK=false` in production. Never expose `SUPABASE_SERVICE_ROLE_KEY`, LINE secrets, GHL OAuth client secret, GHL access token, or GHL refresh token.
-
-## Supabase Setup
-
-Run both migrations in order:
-
-1. `supabase/migrations/202607020001_initial_schema.sql`
-2. `supabase/migrations/202607030001_ghl_oauth_tokens.sql`
-
-In Supabase SQL Editor, paste and run each file one at a time. `Success. No rows returned` is normal because these migrations create or alter schema objects.
-
-The second migration creates `ghl_oauth_tokens` and adds these message diagnostics to `message_events`:
-
-- `ghl_status_code`
-- `ghl_response_body`
-- `request_payload`
-
-RLS enabled is okay because this backend uses the Supabase service role key. Do not expose the service role key publicly.
-
-## OAuth Flow
-
-1. Set the GHL Marketplace app OAuth callback URL to `https://api.win-crm.ai/oauth/callback`.
-2. Add `GHL_OAUTH_CLIENT_ID`, `GHL_OAUTH_CLIENT_SECRET`, and `GHL_OAUTH_REDIRECT_URI` in Railway.
-3. Install the Marketplace app into the target GHL location.
-4. HighLevel redirects to `/oauth/callback?code=...`.
-5. The middleware exchanges the code for an access token and refresh token.
-6. Tokens are stored server-side in Supabase `ghl_oauth_tokens` for the `GHL_LOCATION_ID`.
-7. Calls to GHL use the stored OAuth access token.
-8. If the token is expired or close to expiry, the middleware refreshes it.
-9. If a GHL request returns 401, the middleware refreshes once and retries once.
-
-Debug after installing:
+Then open:
 
 ```text
-GET https://api.win-crm.ai/debug/oauth-status
-GET https://api.win-crm.ai/debug/ghl-token-test
+https://api.win-crm.ai/debug/env-check
 ```
 
-These routes do not return token values.
+Every required variable should show `present`. Optional variables may be `missing`. This endpoint never shows the actual secret values.
 
-## LINE To GHL Flow
+### 5. Get LINE Credentials
 
-When LINE sends a text message:
+1. Open the LINE Developers Console.
+2. Choose your provider and Messaging API channel.
+3. In **Basic settings**, copy **Channel secret** into `LINE_CHANNEL_SECRET`.
+4. In **Messaging API**, issue or copy the long-lived **Channel access token** into `LINE_CHANNEL_ACCESS_TOKEN`.
+5. In **Messaging API**, set the webhook URL to:
 
-1. The webhook validates `x-line-signature`.
-2. The route immediately returns `{ "ok": true, "accepted": true }` to LINE.
-3. The event is saved to `webhook_events`.
-4. The LINE profile is saved or updated in `line_profiles`.
-5. If no GHL contact mapping exists, the middleware creates a GHL contact using the stored OAuth token.
-6. The LINE user is mapped to the GHL contact in `line_profiles`.
-7. The GHL contact is created or updated with tags `line` and `line:{LINE_USER_ID}`.
-8. Optional LINE custom fields are updated when configured.
-9. The LINE message is posted to GHL through `/conversations/messages/inbound` using the location OAuth token.
-10. `message_events` stores `success` or `failed`, plus GHL status/body/request details when available.
+```text
+https://api.win-crm.ai/webhooks/line/inbound
+```
 
-The inbound LINE message should appear inside the same GHL contact conversation thread. Creating the GHL contact alone is not success; check `message_events` and the GHL conversation.
+6. Enable **Use webhook**.
+7. Disable LINE auto-reply if HighLevel should handle the replies.
+8. In LINE Official Account Manager, disable auto-response messages so test replies are not confused with HighLevel replies.
 
-## GHL To LINE Flow
+### 6. Get GHL Marketplace OAuth Credentials
 
-GHL sends outbound replies to the Conversation Provider Delivery URL:
+1. In HighLevel, open your Marketplace app.
+2. Set the app OAuth callback URL to:
+
+```text
+https://api.win-crm.ai/oauth/callback
+```
+
+3. Copy the Marketplace app client ID into `GHL_OAUTH_CLIENT_ID`.
+4. Copy the Marketplace app client secret into `GHL_OAUTH_CLIENT_SECRET`.
+5. Find the target location ID in the location settings, business profile, or the HighLevel URL. Put it in `GHL_LOCATION_ID`.
+6. Put `https://api.win-crm.ai/oauth/callback` into `GHL_OAUTH_REDIRECT_URI`.
+7. Install the Marketplace app into the target location. HighLevel should redirect to `/oauth/callback?code=...`, and the middleware will store the access and refresh tokens in Supabase.
+8. Open `https://api.win-crm.ai/debug/oauth-status` and confirm `token_present` and `refresh_token_present` are `true`.
+9. Open `https://api.win-crm.ai/debug/ghl-token-test` and confirm the stored OAuth token can call HighLevel.
+
+### 7. Configure The GHL Conversation Provider
+
+1. Create or open your custom Conversation Provider for the target location.
+2. Copy the custom provider ID into `GHL_CUSTOM_PROVIDER_ID`.
+3. Optionally create GHL custom fields for LINE user ID and LINE display name, then put their field IDs into `GHL_LINE_USER_ID_FIELD_ID` and `GHL_LINE_DISPLAY_NAME_FIELD_ID`.
+4. If the provider lets you set a delivery secret, use the same value as `GHL_CUSTOM_PROVIDER_SECRET`.
+5. Set the custom provider Delivery URL to:
 
 ```text
 https://api.win-crm.ai/webhooks/ghl/line/outbound
 ```
 
-That Delivery URL is only for GHL to middleware replies. It is not the OAuth callback URL, and it is not the LINE webhook URL. GHL Marketplace webhooks are separate and are not required unless you add separate GHL event-notification features.
+This Delivery URL is for GHL replies going back to LINE. It is not the OAuth callback URL and it is not the LINE webhook URL.
 
-## API Reference
+### 8. Test LINE To GHL
 
-### `GET /health`
+1. Confirm `/debug/env-check` shows all required variables as `present`.
+2. Confirm `/debug/oauth-status` shows a stored token for `GHL_LOCATION_ID`.
+3. Confirm `/debug/ghl-token-test` succeeds.
+4. Send a text message to the LINE Official Account from a real LINE user.
+5. In Supabase, check that `webhook_events` has the raw LINE event.
+6. Check that `line_profiles` has a row for that `line_user_id` and a `ghl_contact_id`.
+7. Confirm the GHL contact has source `LINE Official Account` if GHL accepted it.
+8. Confirm the GHL contact has tags `line` and `line:{LINE_USER_ID}`.
+9. Confirm the LINE message appears inside the GHL contact conversation thread.
+10. If the message does not appear, open `/debug/recent-events` and inspect `message_events` for `status`, `error_message`, `ghl_status_code`, `ghl_response_body`, and `request_payload`.
 
-Returns `{ "ok": true }` plus service metadata.
+### 9. Test GHL To LINE
 
-### `GET /debug/env-check`
+1. Open the GHL conversation that was created or mapped from LINE.
+2. Send a reply from GHL.
+3. GHL should POST to `https://api.win-crm.ai/webhooks/ghl/line/outbound`.
+4. The middleware should find the Supabase mapping and push the reply to the LINE user.
+5. Check `message_events` in Supabase if the message does not arrive.
 
-Returns `present` or `missing` for required and optional environment variables. It never returns real secret values.
+### 10. Common Errors And Debugging
 
-### `GET /debug/recent-events`
-
-Returns the latest 10 `line_profiles`, latest 10 `message_events`, and latest 10 `webhook_events` rows with secret-looking fields redacted. Use this to inspect status, `error_message`, `ghl_status_code`, `ghl_response_body`, and redacted `request_payload`.
-
-### `GET /debug/oauth-status`
-
-Returns token state for `GHL_LOCATION_ID`:
-
-- `location_id`
-- `token_present`
-- `refresh_token_present`
-- `expires_at`
-- `expired`
-- `scopes`
-- `company_id`
-
-It never returns access or refresh token values.
-
-### `GET /debug/ghl-token-test`
-
-Uses the stored OAuth token to call a simple GHL location endpoint. Returns success or failure, status code, endpoint, auth mode, and a redacted response body.
-
-### `GET /oauth/callback`
-
-Accepts the GHL OAuth `code`, exchanges it for tokens, stores them in Supabase, and returns safe install status.
-
-### `POST /webhooks/line` and `POST /webhooks/line/inbound`
-
-Receives LINE inbound webhooks. Requires a valid `x-line-signature` header.
-
-### `POST /webhooks/ghl/outbound` and `POST /webhooks/ghl/line/outbound`
-
-Receives outbound GHL Conversation Provider messages. If `GHL_CUSTOM_PROVIDER_SECRET` is configured, include it in `x-provider-secret` or `x-ghl-secret`.
-
-### `POST /admin/mappings`
-
-Manual override for linking a LINE user to an existing GHL contact or conversation. Requires `WEBHOOK_SHARED_SECRET`.
-
-## Hugo Setup Checklist
-
-1. Run the Supabase migrations.
-2. Deploy the repo to Railway.
-3. Add Railway environment variables.
-4. Connect the Railway custom domain `api.win-crm.ai`.
-5. Set the GHL Marketplace OAuth callback URL to `https://api.win-crm.ai/oauth/callback`.
-6. Install the GHL Marketplace app into the target location.
-7. Confirm `/debug/oauth-status` shows `token_present: true` and `refresh_token_present: true`.
-8. Confirm `/debug/ghl-token-test` succeeds.
-9. Set LINE Developers webhook URL to `https://api.win-crm.ai/webhooks/line/inbound`.
-10. Set GHL Conversation Provider Delivery URL to `https://api.win-crm.ai/webhooks/ghl/line/outbound`.
-11. Disable LINE auto-response in LINE Official Account Manager so test replies are not confusing.
-12. Send a real LINE message.
-13. Check `/debug/recent-events` and Supabase `message_events`.
-14. Confirm the message appears in the GHL contact conversation thread.
-
-## Common Errors
-
-- `HighLevel API 401`: OAuth token is missing, expired and not refreshable, belongs to the wrong location, or lacks required scopes. Check `/debug/oauth-status`, `/debug/ghl-token-test`, and `message_events`.
-- `No HighLevel OAuth token is stored`: Install the Marketplace app and complete `/oauth/callback`.
-- Contact is created but message is missing in GHL Conversations: Check `message_events.ghl_status_code`, `message_events.ghl_response_body`, and `message_events.request_payload`.
-- Tags are missing: Send another LINE message and check whether `message_events.error_message` includes a contact metadata warning.
-- `Invalid LINE signature`: Check `LINE_CHANNEL_SECRET` and make sure LINE posts directly to `/webhooks/line/inbound`.
+- `Invalid LINE signature`: Check `LINE_CHANNEL_SECRET`, confirm the webhook URL is exactly `/webhooks/line/inbound`, and make sure LINE is sending directly to the deployed service.
 - `LINE API 401`: Check `LINE_CHANNEL_ACCESS_TOKEN`.
-- GHL replies do not reach LINE: Confirm the provider Delivery URL is `/webhooks/ghl/line/outbound` and the GHL contact/conversation exists in `line_profiles`.
+- `HighLevel API 401`: Check `/debug/oauth-status` first. If there is no token, install the Marketplace app. If the token exists, open `/debug/ghl-token-test`; the response usually separates token, scope, endpoint, and location problems.
+- `HighLevel create contact response did not include a contact id`: The GHL create-contact response shape changed or the token cannot create contacts. Check the Railway logs and the HighLevel API response.
+- `GHL_LOCATION_ID is required` or `GHL_CUSTOM_PROVIDER_ID is required`: Add the missing Railway variable and redeploy.
+- GHL replies do not reach LINE: Confirm the GHL provider delivery URL is `/webhooks/ghl/line/outbound`, confirm `GHL_CUSTOM_PROVIDER_SECRET` matches if you use one, and confirm the GHL contact or conversation exists in `line_profiles`.
+- Railway deploy is live but webhooks fail: Open `/health`, then `/debug/env-check`, then Railway logs. Fix missing variables first.
+- `webhook_events` is empty: Older versions did not write incoming LINE events there. After this update, every incoming LINE event should create or update a `webhook_events` row.
+- `message_events` has `failed` with `HighLevel API 401`: The installed-location OAuth token is missing, expired and not refreshable, lacks required scopes, or belongs to a different location.
+
+## Deployment Notes
+
+- Deploy behind HTTPS. LINE and HighLevel webhooks should not target plain HTTP in production.
+- Keep Supabase service role credentials server-side only.
+- Preserve raw request bodies for LINE signature validation.
+- Review message attachment handling before enabling binary media sync. This starter records non-text LINE messages as text placeholders.
+- For multi-location deployments, extend `tenants` and route selection so each provider/channel pair can use distinct LINE and GHL credentials.
+- `line_profiles` stores the LINE user ID to GHL contact ID mapping.
+- `message_events` stores sent, skipped, and failed message sync attempts.
+- `webhook_events` stores incoming LINE/GHL webhook payloads and when background processing finished.
+- `ghl_oauth_tokens` stores HighLevel Marketplace OAuth access and refresh tokens server-side only.
+
+## Troubleshooting
+
+- `Invalid LINE signature`: Verify `LINE_CHANNEL_SECRET`, webhook URL, and that no proxy reformats the request body.
+- GHL contact was created for the wrong person: Link the LINE user to the correct existing contact through `/admin/mappings`.
+- Outbound messages skipped: Confirm the GHL webhook payload includes a `contactId` or `conversationId` that exists in `line_profiles`.
+- HighLevel API errors: Check `/debug/oauth-status`, `/debug/ghl-token-test`, `GHL_API_VERSION`, provider ID, location ID, OAuth scopes, and the redacted `message_events` payload.
+- Confusing LINE test replies: Disable LINE auto-response in LINE Official Account Manager.
