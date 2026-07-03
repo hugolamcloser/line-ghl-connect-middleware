@@ -55,6 +55,7 @@ Important values:
 - `LINE_CHANNEL_ACCESS_TOKEN`: Used to call LINE profile and push message APIs.
 - `GHL_LOCATION_ID`: HighLevel location ID.
 - `GHL_CUSTOM_PROVIDER_ID`: Your HighLevel custom Conversation Provider ID.
+- `GHL_INBOUND_MESSAGE_TYPE`: HighLevel inbound message `type`. Use `SMS` for an added SMS custom conversation channel, which is the expected LINE setup. Use `Custom` only for an extra Email provider style setup.
 - `GHL_OAUTH_CLIENT_ID`, `GHL_OAUTH_CLIENT_SECRET`, and `GHL_OAUTH_REDIRECT_URI`: HighLevel Marketplace app OAuth settings. Production LINE to GHL forwarding uses the installed location OAuth token stored in Supabase.
 - `GHL_LINE_USER_ID_FIELD_ID`: Optional GHL custom field ID for storing the LINE user ID.
 - `GHL_LINE_DISPLAY_NAME_FIELD_ID`: Optional GHL custom field ID for storing the LINE display name.
@@ -114,6 +115,7 @@ Assuming `PUBLIC_BASE_URL=https://api.win-crm.ai`:
 - OAuth token test: `https://api.win-crm.ai/debug/ghl-token-test`
 - Provider config check: `https://api.win-crm.ai/debug/provider-config`
 - Provider access test: `https://api.win-crm.ai/debug/ghl-provider-test`
+- Inbound message endpoint test: `https://api.win-crm.ai/debug/ghl-inbound-message-endpoint-test`
 
 The original route names still work:
 
@@ -140,11 +142,12 @@ LINE signatures are verified against the exact raw UTF-8 body, so do not put mid
 5. Confirm `GET /debug/oauth-status` shows `token_present: true` for your `GHL_LOCATION_ID`.
 6. Configure a custom Conversation Provider for the target location.
 7. Put the actual custom Conversation Provider ID into `GHL_CUSTOM_PROVIDER_ID`. This is not the Marketplace OAuth client ID.
-8. Set the provider Delivery URL to `https://api.win-crm.ai/webhooks/ghl/line/outbound`.
-9. If the provider supports a custom header or secret field, set it to `GHL_CUSTOM_PROVIDER_SECRET`.
-10. Put the provider ID, location ID, OAuth client settings, and API version into `.env`.
-11. Open `/debug/provider-config`; if `provider_id_equals_oauth_client_id` is `true`, `GHL_CUSTOM_PROVIDER_ID` is almost certainly wrong.
-12. Open `/debug/ghl-provider-test` to verify the stored OAuth token can access the configured provider ID.
+8. For LINE, set `GHL_INBOUND_MESSAGE_TYPE=SMS`. HighLevel documents added SMS custom conversation channels as `type: "SMS"` plus `conversationProviderId`.
+9. Set the provider Delivery URL to `https://api.win-crm.ai/webhooks/ghl/line/outbound`.
+10. If the provider supports a custom header or secret field, set it to `GHL_CUSTOM_PROVIDER_SECRET`.
+11. Put the provider ID, location ID, OAuth client settings, inbound message type, and API version into `.env`.
+12. Open `/debug/provider-config`; if `provider_id_equals_oauth_client_id` is `true`, `GHL_CUSTOM_PROVIDER_ID` is almost certainly wrong.
+13. Open `/debug/ghl-provider-test` and `/debug/ghl-inbound-message-endpoint-test` to verify the stored OAuth token can access the configured provider ID and inbound endpoint.
 
 The inbound message client posts to:
 
@@ -154,7 +157,11 @@ POST /conversations/messages/inbound
 
 with the configured `Version` header and the stored Marketplace OAuth access token for the location. If the access token is expired or close to expiry, the middleware refreshes it and retries a 401 once.
 
+For an added SMS custom conversation provider, the payload uses `type: "SMS"` and includes `conversationProviderId`. For an extra Email custom provider, HighLevel documents `type: "Custom"` and `conversationProviderId`. Use `GHL_INBOUND_MESSAGE_TYPE` only to match the provider type configured in HighLevel.
+
 If `/debug/oauth-status` shows `token_present: true` and `refresh_token_present: true`, the Marketplace OAuth install/token storage is working. If message forwarding then fails with `CONVERSATIONS_MSG_PROVIDER_NO_ACCESS`, the configured `GHL_CUSTOM_PROVIDER_ID` is wrong, not installed for this location, or not connected to the currently installed Marketplace app version.
+
+If HighLevel returns `This authClass type is not allowed to access this scope`, the OAuth token can exist and still be rejected by the inbound-message API. Check that the Marketplace app version installed in the location includes the Conversation Provider module, that the provider was created under that same app/version, that the location has the provider installed under Settings > Conversation Providers, and that `GHL_INBOUND_MESSAGE_TYPE` matches the provider type.
 
 The Conversation Provider Delivery URL is only for GHL to middleware outbound messages. LINE inbound messages come from the LINE webhook and are then written into GHL through the LeadConnector API with the installed-location OAuth token. Marketplace webhooks are separate from the Conversation Provider Delivery URL and are not required for this app unless you add separate GHL event-notification features.
 
@@ -212,11 +219,15 @@ Uses the stored OAuth access token for `GHL_LOCATION_ID` to call a simple HighLe
 
 ### `GET /debug/provider-config`
 
-Returns the configured `GHL_CUSTOM_PROVIDER_ID`, whether it exactly equals `GHL_OAUTH_CLIENT_ID`, `GHL_LOCATION_ID`, whether an OAuth token is present, and the selected auth mode. It never returns token or secret values.
+Returns the configured `GHL_CUSTOM_PROVIDER_ID`, whether it exactly equals `GHL_OAUTH_CLIENT_ID`, `GHL_LOCATION_ID`, configured inbound message type, whether an OAuth token is present, and the selected auth mode. It never returns token or secret values.
 
 ### `GET /debug/ghl-provider-test`
 
 Uses the stored OAuth token and configured `GHL_CUSTOM_PROVIDER_ID` against the same inbound conversation-message path used for real LINE messages. Returns `provider_access_ok`, GHL status code, and any non-secret `canonicalCode` or message from HighLevel.
+
+### `GET /debug/ghl-inbound-message-endpoint-test`
+
+Uses the stored OAuth token, configured `GHL_CUSTOM_PROVIDER_ID`, and configured `GHL_INBOUND_MESSAGE_TYPE` to make the smallest safe inbound-message probe against HighLevel. It uses a fake contact ID, so a `400` validation response can be useful: it usually means the endpoint, auth class, and provider binding were reached and the remaining problem is payload/contact validation. The response includes endpoint path, method, auth mode, provider ID, location ID, redacted payload, status code, `canonicalCode` when present, redacted GHL response body, and a diagnosis label.
 
 ### `GET /oauth/callback`
 
@@ -331,6 +342,7 @@ GHL_OAUTH_CLIENT_ID=...
 GHL_OAUTH_CLIENT_SECRET=...
 GHL_OAUTH_REDIRECT_URI=https://api.win-crm.ai/oauth/callback
 GHL_OAUTH_TOKEN_URL=https://services.leadconnectorhq.com/oauth/token
+GHL_INBOUND_MESSAGE_TYPE=SMS
 GHL_LINE_USER_ID_FIELD_ID=
 GHL_LINE_DISPLAY_NAME_FIELD_ID=
 GHL_ALLOW_PRIVATE_TOKEN_FALLBACK=false
@@ -381,15 +393,17 @@ https://api.win-crm.ai/oauth/callback
 9. Open `https://api.win-crm.ai/debug/ghl-token-test` and confirm the stored OAuth token can call HighLevel.
 10. Open `https://api.win-crm.ai/debug/provider-config` and confirm `provider_id_equals_oauth_client_id` is `false`.
 11. Open `https://api.win-crm.ai/debug/ghl-provider-test` and confirm `provider_access_ok` is not failing with `CONVERSATIONS_MSG_PROVIDER_NO_ACCESS`.
+12. Open `https://api.win-crm.ai/debug/ghl-inbound-message-endpoint-test` and read the diagnosis. A `400` caused by the fake contact ID is better than a `401` because it means HighLevel reached request validation.
 
 ### 7. Configure The GHL Conversation Provider
 
 1. Create or open your custom Conversation Provider for the target location.
 2. Copy the custom provider ID into `GHL_CUSTOM_PROVIDER_ID`.
-3. Optionally create GHL custom fields for LINE user ID and LINE display name, then put their field IDs into `GHL_LINE_USER_ID_FIELD_ID` and `GHL_LINE_DISPLAY_NAME_FIELD_ID`.
-4. If tag creation/update is enabled through this integration, make sure the Marketplace app has the tag scopes `locations/tags.readonly` and `locations/tags.write`.
-5. If the provider lets you set a delivery secret, use the same value as `GHL_CUSTOM_PROVIDER_SECRET`.
-6. Set the custom provider Delivery URL to:
+3. Set `GHL_INBOUND_MESSAGE_TYPE=SMS` for an added SMS custom conversation channel. Use `Custom` only if the provider is configured as an extra Email custom provider.
+4. Optionally create GHL custom fields for LINE user ID and LINE display name, then put their field IDs into `GHL_LINE_USER_ID_FIELD_ID` and `GHL_LINE_DISPLAY_NAME_FIELD_ID`.
+5. If tag creation/update is enabled through this integration, make sure the Marketplace app has the tag scopes `locations/tags.readonly` and `locations/tags.write`.
+6. If the provider lets you set a delivery secret, use the same value as `GHL_CUSTOM_PROVIDER_SECRET`.
+7. Set the custom provider Delivery URL to:
 
 ```text
 https://api.win-crm.ai/webhooks/ghl/line/outbound
@@ -402,13 +416,14 @@ This Delivery URL is for GHL replies going back to LINE. It is not the OAuth cal
 1. Confirm `/debug/env-check` shows all required variables as `present`.
 2. Confirm `/debug/oauth-status` shows a stored token for `GHL_LOCATION_ID`.
 3. Confirm `/debug/ghl-token-test` succeeds.
-4. Send a text message to the LINE Official Account from a real LINE user.
-5. In Supabase, check that `webhook_events` has the raw LINE event.
-6. Check that `line_profiles` has a row for that `line_user_id` and a `ghl_contact_id`.
-7. Confirm the GHL contact has source `LINE Official Account` if GHL accepted it.
-8. Confirm the GHL contact has tags `line` and `line:{LINE_USER_ID}`.
-9. Confirm the LINE message appears inside the GHL contact conversation thread.
-10. If the message does not appear, open `/debug/recent-events` and inspect `message_events` for `status`, `error_message`, `ghl_status_code`, `ghl_response_body`, and `request_payload`.
+4. Confirm `/debug/ghl-inbound-message-endpoint-test` does not report a `401` auth-class or provider-access failure.
+5. Send a text message to the LINE Official Account from a real LINE user.
+6. In Supabase, check that `webhook_events` has the raw LINE event.
+7. Check that `line_profiles` has a row for that `line_user_id` and a `ghl_contact_id`.
+8. Confirm the GHL contact has source `LINE Official Account` if GHL accepted it.
+9. Confirm the GHL contact has tags `line` and `line:{LINE_USER_ID}`.
+10. Confirm the LINE message appears inside the GHL contact conversation thread.
+11. If the message does not appear, open `/debug/recent-events` and inspect `message_events` for `status`, `error_message`, `ghl_status_code`, `ghl_response_body`, and `request_payload`.
 
 ### 9. Test GHL To LINE
 
@@ -424,6 +439,8 @@ This Delivery URL is for GHL replies going back to LINE. It is not the OAuth cal
 - `LINE API 401`: Check `LINE_CHANNEL_ACCESS_TOKEN`.
 - `HighLevel API 401`: Check `/debug/oauth-status` first. If there is no token, install the Marketplace app. If the token exists, open `/debug/ghl-token-test`; the response usually separates token, scope, endpoint, and location problems.
 - `CONVERSATIONS_MSG_PROVIDER_NO_ACCESS`: OAuth is working, but the configured Conversation Provider is not accessible. Check `/debug/provider-config` first. If `provider_id_equals_oauth_client_id` is `true`, replace `GHL_CUSTOM_PROVIDER_ID` with the real custom Conversation Provider ID. If it is `false`, confirm the provider is installed for this GHL location and tied to the current Marketplace app version.
+- `This authClass type is not allowed to access this scope`: OAuth token storage is working, but HighLevel is rejecting the app/provider authorization for the inbound-message API. Open `/debug/ghl-inbound-message-endpoint-test`, confirm `GHL_INBOUND_MESSAGE_TYPE=SMS`, confirm the app has the Conversation Provider Marketplace module and `conversations/message.write`, reinstall the current app version into the location, and verify the provider appears under Settings > Conversation Providers.
+- `/debug/ghl-inbound-message-endpoint-test` returns `400`: This may be expected because the probe uses a fake contact ID. If the diagnosis says payload validation was reached, send a real LINE message and inspect `/debug/recent-events`.
 - `HighLevel create contact response did not include a contact id`: The GHL create-contact response shape changed or the token cannot create contacts. Check the Railway logs and the HighLevel API response.
 - `GHL_LOCATION_ID is required` or `GHL_CUSTOM_PROVIDER_ID is required`: Add the missing Railway variable and redeploy.
 - GHL replies do not reach LINE: Confirm the GHL provider delivery URL is `/webhooks/ghl/line/outbound`, confirm `GHL_CUSTOM_PROVIDER_SECRET` matches if you use one, and confirm the GHL contact or conversation exists in `line_profiles`.
