@@ -42,6 +42,7 @@ lineWebhookRouter.post(["/webhooks/line", "/webhooks/line/inbound"], (req: RawBo
     }
 
     const payload = lineWebhookSchema.parse(req.body) as LineWebhookPayload;
+    logger.info({ eventCount: payload.events.length }, "LINE webhook accepted for background processing");
     res.json({ ok: true, accepted: true });
     void processLineEventsInBackground(payload);
   } catch (error) {
