@@ -3,19 +3,22 @@ import { sendInboundMessageToGhl } from "../integrations/ghlInboundMessageClient
 import {
   createGhlContact,
   ensureGhlContactLineMetadata,
-  getLineInboundFlowAuthDiagnostics
+  getLineInboundFlowAuthDiagnostics,
+  isStaleGhlContactError
 } from "../integrations/ghlLocationClient";
 import { getLineProfile } from "../integrations/lineClient";
-import type { LineMessage, LineSource, LineWebhookEvent } from "../types/line";
+import type { LineMessage, LineProfile, LineSource, LineWebhookEvent } from "../types/line";
 import { getErrorMessage, serializeError } from "../utils/errors";
 import { redactSecrets } from "../utils/redaction";
 import {
+  clearGhlMapping,
   ensureDefaultTenant,
   linkGhlMapping,
   markWebhookEventProcessed,
   saveMessageEvent,
   saveWebhookEvent,
-  upsertLineProfile
+  upsertLineProfile,
+  type LineProfileRecord
 } from "./repository";
 
 function getLineUserId(source: LineSource): string | undefined {
@@ -85,6 +88,101 @@ function buildLineExternalConversationId(lineUserId: string): string {
   return `line:${lineUserId}`;
 }
 
+async function createAndLinkGhlContactForLineUser(input: {
+  tenantId: string;
+  lineUserId: string;
+  lineMessageId?: string;
+  profile: LineProfile | null;
+  metadataWarnings: string[];
+}): Promise<LineProfileRecord> {
+  const contact = await createGhlContact({
+    lineUserId: input.lineUserId,
+    displayName: input.profile?.displayName ?? undefined,
+    pictureUrl: input.profile?.pictureUrl ?? undefined
+  });
+  const record = await linkGhlMapping({
+    tenantId: input.tenantId,
+    lineUserId: input.lineUserId,
+    ghlContactId: contact.id
+  });
+
+  logger.info(
+    { lineUserId: input.lineUserId, lineMessageId: input.lineMessageId, ghlContactId: contact.id },
+    "Created GHL contact for LINE user"
+  );
+
+  try {
+    await ensureGhlContactLineMetadata(contact.id, {
+      lineUserId: input.lineUserId,
+      displayName: input.profile?.displayName ?? undefined,
+      pictureUrl: input.profile?.pictureUrl ?? undefined
+    });
+  } catch (error) {
+    const warning = redactSecrets(serializeError(error));
+    input.metadataWarnings.push(`Failed to ensure LINE tags/custom fields on new GHL contact: ${warning.message}`);
+    logger.warn(
+      {
+        lineUserId: input.lineUserId,
+        lineMessageId: input.lineMessageId,
+        ghlContactId: contact.id,
+        error: warning
+      },
+      "Failed to ensure LINE tags/custom fields on new GHL contact"
+    );
+  }
+
+  return record;
+}
+
+async function recoverStaleGhlContactMapping(input: {
+  tenantId: string;
+  lineUserId: string;
+  lineMessageId?: string;
+  record: LineProfileRecord;
+  profile: LineProfile | null;
+  metadataWarnings: string[];
+  cause: unknown;
+}): Promise<LineProfileRecord> {
+  const oldContactId = input.record.ghl_contact_id ?? undefined;
+  const staleError = redactSecrets(serializeError(input.cause));
+
+  logger.warn(
+    {
+      lineUserId: input.lineUserId,
+      lineMessageId: input.lineMessageId,
+      oldGhlContactId: oldContactId,
+      oldGhlConversationId: input.record.ghl_conversation_id ?? undefined,
+      staleError
+    },
+    "Stale GHL contact mapping detected"
+  );
+
+  await clearGhlMapping({
+    tenantId: input.tenantId,
+    lineUserId: input.lineUserId
+  });
+
+  const recoveredRecord = await createAndLinkGhlContactForLineUser({
+    tenantId: input.tenantId,
+    lineUserId: input.lineUserId,
+    lineMessageId: input.lineMessageId,
+    profile: input.profile,
+    metadataWarnings: input.metadataWarnings
+  });
+
+  logger.info(
+    {
+      lineUserId: input.lineUserId,
+      lineMessageId: input.lineMessageId,
+      oldGhlContactId: oldContactId,
+      newGhlContactId: recoveredRecord.ghl_contact_id
+    },
+    "Created replacement GHL contact after stale mapping recovery"
+  );
+
+  return recoveredRecord;
+}
+
 export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<{
   status: "processed" | "skipped" | "failed";
   reason?: string;
@@ -117,6 +215,7 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
       return { status: "skipped", reason: `Unsupported LINE event type: ${event.type}` };
     }
 
+    const lineMessage = event.message;
     const profile = event.source.type === "user" ? await getLineProfile(lineUserId) : null;
     let record = await upsertLineProfile({
       tenantId,
@@ -127,15 +226,15 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
       pictureUrl: profile?.pictureUrl
     });
 
-    const { text, attachments, supported, skipReason } = messageToText(event.message);
+    const { text, attachments, supported, skipReason } = messageToText(lineMessage);
 
     if (!supported || !text) {
       const requestPayload = redactSecrets({
         ...getLineInboundFlowAuthDiagnostics("send_message"),
         contact_step: "send_message",
         skipped_reason: skipReason,
-        line_message_type: event.message.type,
-        line_message_id: event.message.id,
+        line_message_type: lineMessage.type,
+        line_message_id: lineMessage.id,
         outbound_ghl_request_body: null
       });
 
@@ -143,7 +242,7 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
         tenantId,
         provider: "line",
         direction: "inbound",
-        externalMessageId: event.message.id,
+        externalMessageId: lineMessage.id,
         lineUserId,
         payload: event,
         status: "skipped",
@@ -155,7 +254,7 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
         {
           lineUserId,
           lineMessageId,
-          lineMessageType: event.message.type,
+          lineMessageType: lineMessage.type,
           messageEventStatus: "skipped"
         },
         "Skipped unsupported LINE message type for HighLevel inbound message send"
@@ -165,42 +264,17 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
     }
 
     const metadataWarnings: string[] = [];
+    let staleMappingRecovered = false;
 
     try {
       if (!record.ghl_contact_id) {
-        const contact = await createGhlContact({
-          lineUserId,
-          displayName: profile?.displayName ?? undefined,
-          pictureUrl: profile?.pictureUrl ?? undefined
-        });
-
-        record = await linkGhlMapping({
+        record = await createAndLinkGhlContactForLineUser({
           tenantId,
           lineUserId,
-          ghlContactId: contact.id
+          lineMessageId,
+          profile,
+          metadataWarnings
         });
-
-        logger.info({ lineUserId, lineMessageId, ghlContactId: contact.id }, "Created GHL contact for LINE user");
-
-        try {
-          await ensureGhlContactLineMetadata(contact.id, {
-            lineUserId,
-            displayName: profile?.displayName ?? undefined,
-            pictureUrl: profile?.pictureUrl ?? undefined
-          });
-        } catch (error) {
-          const warning = redactSecrets(serializeError(error));
-          metadataWarnings.push(`Failed to ensure LINE tags/custom fields on new GHL contact: ${warning.message}`);
-          logger.warn(
-            {
-              lineUserId,
-              lineMessageId,
-              ghlContactId: contact.id,
-              error: warning
-            },
-            "Failed to ensure LINE tags/custom fields on new GHL contact"
-          );
-        }
       } else {
         try {
           await ensureGhlContactLineMetadata(record.ghl_contact_id, {
@@ -209,17 +283,30 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
             pictureUrl: profile?.pictureUrl ?? undefined
           });
         } catch (error) {
-          const warning = redactSecrets(serializeError(error));
-          metadataWarnings.push(`Failed to ensure LINE tags/custom fields on existing GHL contact: ${warning.message}`);
-          logger.warn(
-            {
+          if (isStaleGhlContactError(error)) {
+            record = await recoverStaleGhlContactMapping({
+              tenantId,
               lineUserId,
               lineMessageId,
-              ghlContactId: record.ghl_contact_id,
-              error: warning
-            },
-            "Failed to ensure LINE tags/custom fields on existing GHL contact"
-          );
+              record,
+              profile,
+              metadataWarnings,
+              cause: error
+            });
+            staleMappingRecovered = true;
+          } else {
+            const warning = redactSecrets(serializeError(error));
+            metadataWarnings.push(`Failed to ensure LINE tags/custom fields on existing GHL contact: ${warning.message}`);
+            logger.warn(
+              {
+                lineUserId,
+                lineMessageId,
+                ghlContactId: record.ghl_contact_id,
+                error: warning
+              },
+              "Failed to ensure LINE tags/custom fields on existing GHL contact"
+            );
+          }
         }
       }
 
@@ -227,13 +314,48 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
         throw new Error("LINE user could not be linked to a GHL contact");
       }
 
-      const inboundSendResult = await sendInboundMessageToGhl({
-        contactId: record.ghl_contact_id,
-        externalConversationId: buildLineExternalConversationId(lineUserId),
-        externalMessageId: event.message.id,
-        message: text,
-        ...(attachments && attachments.length > 0 ? { attachments } : {})
-      });
+      const sendInboundMessage = () =>
+        sendInboundMessageToGhl({
+          contactId: record.ghl_contact_id as string,
+          externalConversationId: buildLineExternalConversationId(lineUserId),
+          externalMessageId: lineMessage.id,
+          message: text,
+          ...(attachments && attachments.length > 0 ? { attachments } : {})
+        });
+      let inboundSendResult: Awaited<ReturnType<typeof sendInboundMessageToGhl>>;
+
+      try {
+        inboundSendResult = await sendInboundMessage();
+      } catch (error) {
+        if (!staleMappingRecovered && isStaleGhlContactError(error)) {
+          record = await recoverStaleGhlContactMapping({
+            tenantId,
+            lineUserId,
+            lineMessageId,
+            record,
+            profile,
+            metadataWarnings,
+            cause: error
+          });
+          staleMappingRecovered = true;
+
+          if (!record.ghl_contact_id) {
+            throw new Error("LINE user could not be linked to a replacement GHL contact");
+          }
+
+          inboundSendResult = await sendInboundMessage();
+          logger.info(
+            {
+              lineUserId,
+              lineMessageId,
+              newGhlContactId: record.ghl_contact_id
+            },
+            "Inbound LINE message resent after stale GHL contact mapping recovery"
+          );
+        } else {
+          throw error;
+        }
+      }
       const response = inboundSendResult.response;
       const requestPayload = redactSecrets(inboundSendResult.diagnostics);
 
@@ -251,7 +373,7 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
         tenantId,
         provider: "line",
         direction: "inbound",
-        externalMessageId: event.message.id,
+        externalMessageId: lineMessage.id,
         lineUserId,
         ghlMessageId: typeof response.messageId === "string" ? response.messageId : response.id,
         ghlConversationId,
@@ -303,7 +425,7 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
         tenantId,
         provider: "line",
         direction: "inbound",
-        externalMessageId: event.message.id,
+        externalMessageId: lineMessage.id,
         lineUserId,
         payload: {
           lineEvent: event,
