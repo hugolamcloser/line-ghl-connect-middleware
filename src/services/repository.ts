@@ -368,6 +368,23 @@ export async function linkGhlMapping(input: {
   return requireSingle<LineProfileRecord>(data, error);
 }
 
+export async function clearGhlMapping(input: { tenantId: string; lineUserId: string }): Promise<LineProfileRecord> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("line_profiles")
+    .update({
+      ghl_contact_id: null,
+      ghl_conversation_id: null,
+      updated_at: new Date().toISOString()
+    })
+    .eq("tenant_id", input.tenantId)
+    .eq("line_user_id", input.lineUserId)
+    .select("*")
+    .single();
+
+  return requireSingle<LineProfileRecord>(data, error);
+}
+
 export async function saveMessageEvent(input: SaveMessageEventInput): Promise<void> {
   const supabase = getSupabase();
   const { error } = await supabase.from("message_events").insert({
