@@ -216,7 +216,7 @@ Returns whether required environment variables are `present` or `missing`. Secre
 
 ### `GET /debug/recent-events`
 
-Returns the latest 10 `line_profiles`, latest 10 `message_events`, and latest 10 `webhook_events` rows. Secret values are redacted. `message_events` includes sync status, `error_message`, GHL status code, GHL response body, and redacted request payload when available.
+Returns the latest 10 `line_profiles`, latest 10 `message_events`, and latest 10 `webhook_events` rows. Secret values are redacted. `message_events` includes sync status, `error_message`, GHL status code, GHL response body, and redacted request payload when available. Real LINE text inbound sends now store the exact outbound HighLevel request diagnostics in `message_events.request_payload`, including the final `request_body` sent to `/conversations/messages/inbound`.
 
 ### `GET /debug/oauth-status`
 
@@ -483,6 +483,7 @@ This Delivery URL is for GHL replies going back to LINE. It is not the OAuth cal
 - `LINE API 401`: Check `LINE_CHANNEL_ACCESS_TOKEN`.
 - `HighLevel API 401` at `/contacts/`: Open `/debug/ghl-contact-auth-test`. If OAuth returns authClass `401`, set `GHL_LOCATION_API_AUTH_MODE=private_integration`, ensure `GHL_PRIVATE_INTEGRATION_TOKEN` is present, and redeploy.
 - `HighLevel API 401`: Check `/debug/oauth-status` first. If there is no token, install the Marketplace app. If the token exists, open `/debug/ghl-token-test`; the response usually separates token, scope, endpoint, and location problems.
+- `HighLevel API 422` from `/conversations/messages/inbound`: Open `/debug/recent-events` and inspect the latest `message_events.request_payload.request_body`. For text messages it should match the proven payload shape: `locationId`, `contactId`, `type`, `message`, `conversationProviderId` when enabled, `externalConversationId` as `line:{LINE_USER_ID}`, `externalMessageId`, and `attachments: []`.
 - `CONVERSATIONS_MSG_PROVIDER_NO_ACCESS`: OAuth is working, but the configured Conversation Provider is not accessible. Check `/debug/provider-config` first. If `provider_id_equals_oauth_client_id` is `true`, replace `GHL_CUSTOM_PROVIDER_ID` with the real custom Conversation Provider ID. If it is `false`, confirm the provider is installed for this GHL location and tied to the current Marketplace app version.
 - `This authClass type is not allowed to access this scope`: OAuth token storage is working, but HighLevel is rejecting the app/provider authorization for the inbound-message API. Open `/debug/ghl-token-install-summary` and `/debug/ghl-inbound-payload-matrix`. If every payload variant returns the same authClass `401`, payload shape is probably not the blocker; compare the working app token claims/authClass/install type against this app.
 - `/debug/ghl-inbound-message-auth-matrix-test` recommends `private_integration`: OAuth was rejected by auth class, but Private Integration auth reached request validation or success for the same endpoint and payload. Set both `GHL_LOCATION_API_AUTH_MODE=private_integration` and `GHL_INBOUND_SEND_AUTH_MODE=private_integration`, redeploy, then confirm `/debug/ghl-contact-auth-test` and `/debug/ghl-inbound-send-auth-test` before sending a real LINE message.
