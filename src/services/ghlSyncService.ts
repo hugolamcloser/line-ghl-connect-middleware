@@ -1,3 +1,4 @@
+import { logger } from "../config/logger";
 import { pushLineTextMessage } from "../integrations/lineClient";
 import type { NormalizedGhlOutboundMessage } from "../types/ghl";
 import {
@@ -60,6 +61,16 @@ export async function processGhlOutboundWebhook(payload: Record<string, unknown>
 }> {
   const tenantId = await ensureDefaultTenant();
   const message = normalizeGhlOutboundMessage(payload);
+
+  logger.info(
+    {
+      contactId: message.contactId,
+      conversationId: message.conversationId,
+      ghlMessageId: message.messageId
+    },
+    "HighLevel outbound provider webhook accepted"
+  );
+
   const mapping = await findLineProfileByGhlIds(tenantId, {
     contactId: message.contactId,
     conversationId: message.conversationId
@@ -77,6 +88,15 @@ export async function processGhlOutboundWebhook(payload: Record<string, unknown>
       errorMessage: "No LINE mapping exists for the GHL contact/conversation"
     });
 
+    logger.warn(
+      {
+        contactId: message.contactId,
+        conversationId: message.conversationId,
+        ghlMessageId: message.messageId
+      },
+      "Skipped HighLevel outbound message because no LINE mapping exists"
+    );
+
     return { status: "skipped", reason: "No LINE mapping found" };
   }
 
@@ -92,6 +112,16 @@ export async function processGhlOutboundWebhook(payload: Record<string, unknown>
     payload,
     status: "sent"
   });
+
+  logger.info(
+    {
+      lineUserId: mapping.line_user_id,
+      contactId: message.contactId,
+      conversationId: message.conversationId,
+      ghlMessageId: message.messageId
+    },
+    "HighLevel outbound message sent to LINE"
+  );
 
   return { status: "processed" };
 }

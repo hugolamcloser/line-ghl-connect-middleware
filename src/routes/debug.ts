@@ -1,5 +1,6 @@
-import { Router } from "express";
-import { getEnvPresenceReport } from "../config/env";
+import { Router, type RequestHandler } from "express";
+import { env, getEnvPresenceReport } from "../config/env";
+import { requireSharedSecret } from "../middleware/sharedSecret";
 import {
   getGhlInboundSendAuthConfigDebug,
   getGhlProviderConfigDebug,
@@ -28,6 +29,15 @@ import { getRecentDebugEvents } from "../services/repository";
 import { redactSecrets } from "../utils/redaction";
 
 export const debugRouter = Router();
+
+const requireSharedSecretInProduction: RequestHandler = (req, res, next) => {
+  if (env.NODE_ENV !== "production") {
+    next();
+    return;
+  }
+
+  requireSharedSecret(req, res, next);
+};
 
 debugRouter.get("/debug/env-check", (_req, res) => {
   res.json({
@@ -186,7 +196,7 @@ debugRouter.get("/debug/ghl-conversation-permission-test", async (_req, res, nex
   }
 });
 
-debugRouter.get("/debug/ghl-inbound-payload-matrix", async (_req, res, next) => {
+debugRouter.get("/debug/ghl-inbound-payload-matrix", requireSharedSecretInProduction, async (_req, res, next) => {
   try {
     res.json({
       ok: true,
@@ -197,7 +207,7 @@ debugRouter.get("/debug/ghl-inbound-payload-matrix", async (_req, res, next) => 
   }
 });
 
-debugRouter.get("/debug/ghl-token-install-summary", async (_req, res, next) => {
+debugRouter.get("/debug/ghl-token-install-summary", requireSharedSecretInProduction, async (_req, res, next) => {
   try {
     res.json({
       ok: true,

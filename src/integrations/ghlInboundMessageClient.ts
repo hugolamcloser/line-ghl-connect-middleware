@@ -499,7 +499,7 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
   const configuredAuthMode = getConfiguredInboundSendAuthMode();
   const effectiveAuthMode = getEffectiveInboundSendAuthMode();
 
-  logger.info(
+  logger.debug(
     {
       method,
       path,
@@ -516,13 +516,13 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
       inboundMessageType: payload.type,
       requestBody: redactSecrets(payload)
     },
-    "Preparing HighLevel inbound conversation provider message"
+    "Prepared HighLevel inbound conversation provider message request"
   );
 
   try {
     const result = await executeConfiguredInboundMessageRequest({ path, method, payload });
 
-    logger.info(
+    logger.debug(
       {
         method,
         path,
@@ -540,7 +540,7 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
         inboundMessageType: payload.type,
         requestDiagnostics: result.diagnostics
       },
-      "Sent HighLevel inbound conversation provider message request"
+      "HighLevel inbound conversation provider message request completed"
     );
 
     if (!result.ok) {
@@ -579,8 +579,8 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
         inboundMessageType: payload.type,
         statusCode: result.statusCode,
         canonicalCode: result.canonicalCode,
-        message: result.message,
-        responseBody: result.responseBody,
+        ghlMessageId: normalizedResponse.messageId ?? normalizedResponse.id,
+        ghlConversationId: normalizedResponse.conversationId,
         messageEventStatus: "success"
       },
       "HighLevel inbound conversation provider message accepted"
