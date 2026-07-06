@@ -18,7 +18,7 @@ type InboundMessagePayload = {
   externalMessageId: string;
   type: string;
   message: string;
-  attachments: string[];
+  attachments?: string[];
 };
 
 type InboundSendDiagnostics = {
@@ -219,6 +219,7 @@ async function getInboundSendAuthContext(locationId: string): Promise<GhlAuthCon
 
 function buildInboundMessagePayload(input: GhlInboundMessageInput): InboundMessagePayload {
   const conversationProviderId = getConfiguredConversationProviderId();
+  const attachments = (input.attachments ?? []).filter((attachment) => attachment.trim().length > 0);
 
   return {
     locationId: requireEnvValue("GHL_LOCATION_ID", env.GHL_LOCATION_ID),
@@ -228,7 +229,7 @@ function buildInboundMessagePayload(input: GhlInboundMessageInput): InboundMessa
     externalMessageId: input.externalMessageId,
     type: getConfiguredInboundMessageType(),
     message: input.message,
-    attachments: input.attachments ?? []
+    ...(attachments.length > 0 ? { attachments } : {})
   };
 }
 
@@ -240,8 +241,7 @@ function buildProviderProbePayload(conversationProviderId: string, locationId: s
     externalConversationId: `debug-provider-test:${locationId}:${conversationProviderId}`,
     externalMessageId: `debug-provider-test:${Date.now()}`,
     type: getConfiguredInboundMessageType(),
-    message: "Provider access probe. This should fail before creating a real message.",
-    attachments: []
+    message: "Provider access probe. This should fail before creating a real message."
   };
 }
 
