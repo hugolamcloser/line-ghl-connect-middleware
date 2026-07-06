@@ -34,17 +34,19 @@ function getLineSourceId(source: LineSource): string {
   return source.userId;
 }
 
-function messageToText(message: LineMessage): { text: string; attachments: string[] } {
+function messageToText(message: LineMessage): { text?: string; attachments: string[]; supported: boolean; skipReason?: string } {
   if (message.type === "text") {
     return {
       text: message.text,
-      attachments: []
+      attachments: [],
+      supported: true
     };
   }
 
   return {
-    text: `[LINE ${message.type} message received. Use LINE content APIs to fetch binary payload ${message.id}.]`,
-    attachments: []
+    attachments: [],
+    supported: false,
+    skipReason: `Unsupported LINE message type for GHL inbound send: ${message.type}`
   };
 }
 
@@ -79,6 +81,10 @@ function mergeRequestPayloadWithAuthDiagnostics(requestPayload: unknown): unknow
   }
 
   return redactSecrets(authDiagnostics);
+}
+
+function buildLineExternalConversationId(lineUserId: string): string {
+  return `line:${lineUserId}`;
 }
 
 export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<{
@@ -123,7 +129,43 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
       pictureUrl: profile?.pictureUrl
     });
 
-    const { text, attachments } = messageToText(event.message);
+    const { text, attachments, supported, skipReason } = messageToText(event.message);
+
+    if (!supported || !text) {
+      const requestPayload = redactSecrets({
+        ...getLineInboundFlowAuthDiagnostics("send_message"),
+        contact_step: "send_message",
+        skipped_reason: skipReason,
+        line_message_type: event.message.type,
+        line_message_id: event.message.id,
+        outbound_ghl_request_body: null
+      });
+
+      await saveMessageEvent({
+        tenantId,
+        provider: "line",
+        direction: "inbound",
+        externalMessageId: event.message.id,
+        lineUserId,
+        payload: event,
+        status: "skipped",
+        errorMessage: skipReason,
+        requestPayload
+      });
+
+      logger.info(
+        {
+          lineUserId,
+          lineMessageId,
+          lineMessageType: event.message.type,
+          messageEventStatus: "skipped"
+        },
+        "Skipped unsupported LINE message type for HighLevel inbound message send"
+      );
+
+      return { status: "skipped", reason: skipReason };
+    }
+
     const metadataWarnings: string[] = [];
 
     try {
@@ -187,14 +229,15 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
         throw new Error("LINE user could not be linked to a GHL contact");
       }
 
-      const response = await sendInboundMessageToGhl({
+      const inboundSendResult = await sendInboundMessageToGhl({
         contactId: record.ghl_contact_id,
-        conversationId: record.ghl_conversation_id ?? undefined,
-        externalConversationId: `${record.line_source_type}:${record.line_source_id}:${record.line_user_id}`,
+        externalConversationId: buildLineExternalConversationId(lineUserId),
         externalMessageId: event.message.id,
         message: text,
         attachments
       });
+      const response = inboundSendResult.response;
+      const requestPayload = redactSecrets(inboundSendResult.diagnostics);
 
       const ghlConversationId = typeof response.conversationId === "string" ? response.conversationId : undefined;
 
@@ -216,10 +259,12 @@ export async function processLineWebhookEvent(event: LineWebhookEvent): Promise<
         ghlConversationId,
         payload: {
           lineEvent: event,
-          ghlResponse: response
+          ghlResponse: response,
+          diagnostics: requestPayload
         },
         status: "success",
-        errorMessage: appendMessage(metadataWarnings, undefined)
+        errorMessage: appendMessage(metadataWarnings, undefined),
+        requestPayload
       });
 
       logger.info(
