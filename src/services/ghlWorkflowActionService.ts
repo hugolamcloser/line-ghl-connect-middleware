@@ -85,12 +85,42 @@ async function findLineProfileByLocationAndGhlContact(
   locationId: string,
   contactId: string
 ): Promise<LineProfileRecord | null> {
+  const normalizedLocationId = locationId.trim();
+  const normalizedContactId = contactId.trim();
   const supabase = getSupabase();
+  const { data: tenants, error: tenantsError } = await supabase
+    .from("tenants")
+    .select("id, location_id, updated_at")
+    .eq("location_id", normalizedLocationId)
+    .order("updated_at", { ascending: false });
+
+  if (tenantsError) {
+    throw new Error(tenantsError.message);
+  }
+
+  const tenantIds = (tenants ?? [])
+    .map((tenant) => (typeof tenant.id === "string" ? tenant.id : undefined))
+    .filter((tenantId): tenantId is string => Boolean(tenantId));
+
+  if (tenantIds.length === 0) {
+    logger.info(
+      {
+        locationId: normalizedLocationId,
+        contactId: normalizedContactId,
+        tenantCount: 0,
+        mappingFound: false
+      },
+      "GHL workflow LINE mapping lookup completed"
+    );
+
+    return null;
+  }
+
   const { data, error } = await supabase
     .from("line_profiles")
-    .select("*, tenants!inner(location_id)")
-    .eq("tenants.location_id", locationId)
-    .eq("ghl_contact_id", contactId)
+    .select("*")
+    .in("tenant_id", tenantIds)
+    .eq("ghl_contact_id", normalizedContactId)
     .order("updated_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -99,7 +129,22 @@ async function findLineProfileByLocationAndGhlContact(
     throw new Error(error.message);
   }
 
-  return data as LineProfileRecord | null;
+  const mapping = data as LineProfileRecord | null;
+
+  logger.info(
+    {
+      locationId: normalizedLocationId,
+      contactId: normalizedContactId,
+      tenantCount: tenantIds.length,
+      mappingFound: Boolean(mapping),
+      foundTenantId: mapping?.tenant_id,
+      foundLineUserId: mapping?.line_user_id,
+      foundGhlConversationId: mapping?.ghl_conversation_id
+    },
+    "GHL workflow LINE mapping lookup completed"
+  );
+
+  return mapping;
 }
 
 export async function processGhlWorkflowSendLine(payload: Record<string, unknown>): Promise<WorkflowSendLineResult> {
@@ -190,17 +235,6 @@ export async function processGhlWorkflowSendLine(payload: Record<string, unknown
   }
 
   const mapping = await findLineProfileByLocationAndGhlContact(locationId, contactId);
-
-  logger.info(
-    {
-      locationId,
-      contactId,
-      mappingFound: Boolean(mapping),
-      lineUserId: mapping?.line_user_id,
-      ghlConversationId: mapping?.ghl_conversation_id
-    },
-    "GHL workflow LINE mapping lookup completed"
-  );
 
   if (!mapping) {
     const tenantId = await ensureDefaultTenant();
