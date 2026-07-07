@@ -4,6 +4,17 @@ import type { LineProfile } from "../types/line";
 
 const lineApiBaseUrl = "https://api.line.me";
 
+export type LinePushTextMessageResult = {
+  messageId?: string;
+  raw?: {
+    sentMessages?: Array<{
+      id?: string;
+      quoteToken?: string;
+    }>;
+    [key: string]: unknown;
+  };
+};
+
 export function verifyLineSignature(rawBody: Buffer, signature: string | undefined): boolean {
   if (!env.LINE_CHANNEL_SECRET || !signature) {
     return false;
@@ -54,8 +65,8 @@ export async function getLineProfile(userId: string): Promise<LineProfile | null
   }
 }
 
-export async function pushLineTextMessage(to: string, text: string): Promise<void> {
-  await lineRequest<void>("/v2/bot/message/push", {
+export async function pushLineTextMessage(to: string, text: string): Promise<LinePushTextMessageResult> {
+  const response = await lineRequest<LinePushTextMessageResult["raw"] | undefined>("/v2/bot/message/push", {
     method: "POST",
     body: JSON.stringify({
       to,
@@ -67,4 +78,9 @@ export async function pushLineTextMessage(to: string, text: string): Promise<voi
       ]
     })
   });
+
+  return {
+    messageId: response?.sentMessages?.[0]?.id,
+    raw: response
+  };
 }
