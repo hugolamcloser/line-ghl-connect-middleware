@@ -1,5 +1,6 @@
 export type GhlCreateContactInput = {
   lineUserId: string;
+  locationId?: string;
   displayName?: string;
   pictureUrl?: string;
 };
@@ -11,6 +12,8 @@ export type GhlContactResponse = {
 
 export type GhlInboundMessageInput = {
   contactId: string;
+  locationId?: string;
+  conversationProviderId?: string;
   conversationId?: string;
   externalConversationId: string;
   externalMessageId: string;
