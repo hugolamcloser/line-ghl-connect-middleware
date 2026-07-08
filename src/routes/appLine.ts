@@ -8,6 +8,7 @@ import {
   disconnectLineChannel,
   getLineConnectionSettings
 } from "../services/lineConnectionService";
+import { appLinePageRouter } from "./appLinePage";
 
 const locationBodySchema = z.object({
   locationId: z.string().min(1)
@@ -35,6 +36,8 @@ const connectBodySchema = z
   );
 
 export const appLineRouter = Router();
+
+appLineRouter.use(appLinePageRouter);
 
 function getPublicBaseUrl(req: Request): string {
   if (env.PUBLIC_BASE_URL) {
