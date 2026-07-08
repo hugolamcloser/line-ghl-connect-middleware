@@ -25,12 +25,18 @@ function resolveLineChannelAccessToken(channelAccessToken?: string): string {
   return requireEnvValue("LINE_CHANNEL_ACCESS_TOKEN", env.LINE_CHANNEL_ACCESS_TOKEN);
 }
 
-export function verifyLineSignature(rawBody: Buffer, signature: string | undefined): boolean {
-  if (!env.LINE_CHANNEL_SECRET || !signature) {
+export function verifyLineSignature(
+  rawBody: Buffer,
+  signature: string | undefined,
+  channelSecret?: string
+): boolean {
+  const resolvedChannelSecret = channelSecret?.trim() || env.LINE_CHANNEL_SECRET;
+
+  if (!resolvedChannelSecret || !signature) {
     return false;
   }
 
-  const expected = crypto.createHmac("sha256", env.LINE_CHANNEL_SECRET).update(rawBody).digest("base64");
+  const expected = crypto.createHmac("sha256", resolvedChannelSecret).update(rawBody).digest("base64");
   const expectedBuffer = Buffer.from(expected);
   const actualBuffer = Buffer.from(signature);
 
