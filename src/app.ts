@@ -1,4 +1,4 @@
-import type { IncomingMessage } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import express from "express";
 import helmet from "helmet";
 import pino from "pino";
@@ -58,12 +58,42 @@ function redactRequestSerializer(req: IncomingMessage): Record<string, unknown> 
   return serializedReq;
 }
 
+function redactResponseHeaders(headers: unknown): unknown {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    return headers;
+  }
+
+  const redactedHeaders = { ...(headers as Record<string, unknown>) };
+
+  for (const [key, value] of Object.entries(redactedHeaders)) {
+    if (key.toLowerCase() !== "location") {
+      continue;
+    }
+
+    if (typeof value === "string") {
+      redactedHeaders[key] = redactSensitiveUrlQuery(value);
+    } else if (Array.isArray(value)) {
+      redactedHeaders[key] = value.map((item) => (typeof item === "string" ? redactSensitiveUrlQuery(item) : item));
+    }
+  }
+
+  return redactedHeaders;
+}
+
+function redactResponseSerializer(res: ServerResponse): Record<string, unknown> {
+  const serializedRes = pino.stdSerializers.res(res) as unknown as Record<string, unknown> & { headers?: unknown };
+
+  serializedRes.headers = redactResponseHeaders(serializedRes.headers);
+
+  return serializedRes;
+}
+
 export function createApp() {
   const app = express();
 
   app.disable("x-powered-by");
   app.use(helmet());
-  app.use(pinoHttp({ logger, serializers: { req: redactRequestSerializer } }));
+  app.use(pinoHttp({ logger, serializers: { req: redactRequestSerializer, res: redactResponseSerializer } }));
   app.use(jsonBodyParser);
 
   app.use(healthRouter);
