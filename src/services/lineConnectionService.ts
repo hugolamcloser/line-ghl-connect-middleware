@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { logger } from "../config/logger";
 import { getSupabase } from "../config/supabase";
-import { validateLineChannelAccessToken } from "../integrations/lineClient";
+import { getLineBotInfo, validateLineChannelAccessToken } from "../integrations/lineClient";
 import { HttpError } from "../middleware/errors";
 
 type TenantRecord = {
@@ -28,6 +28,13 @@ export type LineConnectionSettings = {
   is_active: boolean;
   channel_access_token_length: number;
   channel_secret_length: number;
+  line_bot_info: LineBotDisplayInfo | null;
+};
+
+export type LineBotDisplayInfo = {
+  displayName: string | null;
+  basicId: string | null;
+  pictureUrl: string | null;
 };
 
 function normalizeLocationId(locationId: string): string {
@@ -52,11 +59,42 @@ function buildWebhookUrl(publicBaseUrl: string, webhookKey: string | null): stri
   return `${publicBaseUrl.replace(/\/+$/, "")}/webhooks/line/${encodeURIComponent(webhookKey)}/inbound`;
 }
 
-function toSettings(channel: LineChannelRecord | null, publicBaseUrl: string): LineConnectionSettings {
+function getString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+async function getSafeLineBotInfo(channel: LineChannelRecord | null): Promise<LineBotDisplayInfo | null> {
+  if (!channel?.is_active || !channel.channel_access_token?.trim()) {
+    return null;
+  }
+
+  try {
+    const botInfo = await getLineBotInfo(channel.channel_access_token);
+
+    return {
+      displayName: getString(botInfo.displayName),
+      basicId: getString(botInfo.basicId),
+      pictureUrl: getString(botInfo.pictureUrl)
+    };
+  } catch (error) {
+    logger.warn(
+      {
+        lineChannelId: channel.id,
+        errorMessage: error instanceof Error ? error.message : "Unknown LINE bot info error"
+      },
+      "Failed to load LINE bot info for connection settings"
+    );
+
+    return null;
+  }
+}
+
+async function toSettings(channel: LineChannelRecord | null, publicBaseUrl: string): Promise<LineConnectionSettings> {
   const webhookKey = channel?.webhook_key?.trim() || null;
   const isActive = Boolean(channel?.is_active);
   const channelAccessTokenLength = isActive ? channel?.channel_access_token?.length ?? 0 : 0;
   const channelSecretLength = isActive ? channel?.channel_secret?.length ?? 0 : 0;
+  const lineBotInfo = await getSafeLineBotInfo(channel);
 
   return {
     connected: isActive,
@@ -64,7 +102,8 @@ function toSettings(channel: LineChannelRecord | null, publicBaseUrl: string): L
     webhook_url: buildWebhookUrl(publicBaseUrl, webhookKey),
     is_active: isActive,
     channel_access_token_length: channelAccessTokenLength,
-    channel_secret_length: channelSecretLength
+    channel_secret_length: channelSecretLength,
+    line_bot_info: lineBotInfo
   };
 }
 
@@ -157,7 +196,7 @@ export async function getLineConnectionSettings(input: {
   const tenant = await getTenantByLocationId(input.locationId);
 
   if (!tenant) {
-    return toSettings(null, input.publicBaseUrl);
+    return await toSettings(null, input.publicBaseUrl);
   }
 
   const channel = await getLineChannelByTenantId(tenant.id);
@@ -172,7 +211,7 @@ export async function getLineConnectionSettings(input: {
     "Loaded LINE connection settings"
   );
 
-  return toSettings(channel, input.publicBaseUrl);
+  return await toSettings(channel, input.publicBaseUrl);
 }
 
 export async function connectLineChannel(input: {
@@ -225,7 +264,7 @@ export async function connectLineChannel(input: {
     "Connected LINE channel for tenant"
   );
 
-  return toSettings(channel, input.publicBaseUrl);
+  return await toSettings(channel, input.publicBaseUrl);
 }
 
 export async function disconnectLineChannel(input: {
@@ -235,7 +274,7 @@ export async function disconnectLineChannel(input: {
   const tenant = await getTenantByLocationId(input.locationId);
 
   if (!tenant) {
-    return toSettings(null, input.publicBaseUrl);
+    return await toSettings(null, input.publicBaseUrl);
   }
 
   const channel = await setLineChannelActiveByTenantId(tenant.id, false);
@@ -250,5 +289,5 @@ export async function disconnectLineChannel(input: {
     "Disconnected LINE channel for tenant"
   );
 
-  return toSettings(channel, input.publicBaseUrl);
+  return await toSettings(channel, input.publicBaseUrl);
 }

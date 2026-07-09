@@ -205,6 +205,7 @@ async function renderLinePage(
     locationId: input.locationId,
     publicBaseUrl: getPublicBaseUrl(req)
   });
+  const avatarDataUrl = await getLineBotAvatarDataUrl(settings.line_bot_info?.pictureUrl);
   const scriptNonce = crypto.randomBytes(16).toString("base64url");
 
   setPageHeaders(res, scriptNonce);
@@ -212,6 +213,7 @@ async function renderLinePage(
     buildLinePageHtml({
       ...input,
       settings,
+      avatarDataUrl,
       scriptNonce,
       connectActionToken: createSignedToken({
         kind: "page_action",
@@ -231,6 +233,7 @@ function buildLinePageHtml(input: {
   locationId: string;
   pageToken: string;
   settings: LineConnectionSettings;
+  avatarDataUrl: string | null;
   connectActionToken: string;
   disconnectActionToken: string;
   scriptNonce: string;
@@ -240,62 +243,32 @@ function buildLinePageHtml(input: {
   const webhookUrl = input.settings.webhook_url ?? "";
   const statusLabel = input.settings.connected ? "Connected" : "Not connected";
   const statusClass = input.settings.connected ? "connected" : "disconnected";
+  const accountName = input.settings.line_bot_info?.displayName || "Connected LINE Official Account";
+  const basicId = input.settings.line_bot_info?.basicId;
+  const content = input.settings.connected
+    ? buildConnectedView({ ...input, webhookUrl, accountName, basicId })
+    : buildNotConnectedView({ ...input, webhookUrl });
 
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LINE Connection</title>
+<title>LINE Official Account</title>
 <style>
-:root{--bg:#f6f7f9;--panel:#fff;--border:#dfe3ea;--text:#162033;--muted:#667085;--line:#06c755;--line-dark:#049746;--danger:#ba1a1a;--ok:#edfdf4}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(920px,calc(100vw - 32px));margin:0 auto;padding:28px 0}.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}h1,h2{margin:0;letter-spacing:0}h1{font-size:24px;line-height:1.2}h2{font-size:16px;margin-bottom:14px}.tenant,.help{color:var(--muted);font-size:13px}.tenant{margin-top:4px;word-break:break-all}.pill{border:1px solid var(--border);border-radius:999px;padding:6px 12px;background:#fff;font-size:13px;font-weight:700;white-space:nowrap}.pill.connected{color:#067647;border-color:#abefc6;background:var(--ok)}.pill.disconnected{color:#7a4b00;border-color:#fedf89;background:#fffaeb}.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 12px 30px rgba(21,28,43,.08)}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.metric{border:1px solid var(--border);border-radius:8px;padding:14px}.metric-label{color:var(--muted);font-size:12px;margin-bottom:6px}.metric-value{font-size:18px;font-weight:700;word-break:break-word}.field{margin-bottom:14px}label{display:block;color:#344054;font-weight:700;font-size:13px;margin-bottom:6px}input,textarea{width:100%;border:1px solid var(--border);border-radius:8px;padding:11px 12px;font:inherit;color:var(--text);background:#fff}textarea{min-height:96px;resize:vertical}input[readonly]{background:#f9fafb}.inline{display:flex;gap:10px}.inline input{min-width:0}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}button{border:0;border-radius:8px;padding:10px 14px;min-height:42px;font:inherit;font-weight:700;cursor:pointer}.primary{background:var(--line);color:#fff}.primary:hover{background:var(--line-dark)}.secondary{background:#eef2f6;color:var(--text)}.danger{background:var(--danger);color:#fff}button:disabled{cursor:not-allowed;opacity:.55}.notice,.error{border-radius:8px;padding:12px 14px;margin-bottom:16px}.notice{border:1px solid #abefc6;background:var(--ok);color:#05603a}.error{border:1px solid #fecdca;background:#fff1f0;color:var(--danger)}@media(max-width:720px){main{width:min(100vw - 24px,920px);padding:20px 0}.topbar{flex-direction:column}.grid{grid-template-columns:1fr}.inline{flex-direction:column}}
+:root{--bg:#f6f7f9;--panel:#fff;--border:#dfe3ea;--text:#162033;--muted:#667085;--line:#06c755;--line-dark:#049746;--danger:#ba1a1a;--danger-bg:#fff1f0;--ok:#edfdf4;--ok-border:#abefc6;--warn:#fffaeb;--warn-border:#fedf89}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(920px,calc(100vw - 32px));margin:0 auto;padding:28px 0}.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}h1,h2,h3,p{margin:0}h1{font-size:28px;line-height:1.15}h2{font-size:18px;margin-bottom:12px}h3{font-size:15px;margin-bottom:8px}.tenant,.help,.small{color:var(--muted);font-size:13px}.tenant{margin-top:6px;word-break:break-all}.pill{border:1px solid var(--border);border-radius:999px;padding:9px 16px;background:#fff;font-size:15px;font-weight:800;white-space:nowrap}.pill.connected{color:#067647;border-color:var(--ok-border);background:var(--ok)}.pill.disconnected{color:#7a4b00;border-color:var(--warn-border);background:var(--warn)}.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:22px;margin-bottom:16px;box-shadow:0 12px 30px rgba(21,28,43,.08)}.success{border-color:var(--ok-border);background:linear-gradient(180deg,#f6fef9,#fff)}.danger-panel{border-color:#fecdca;background:var(--danger-bg)}.account{display:flex;align-items:center;gap:14px;margin-top:16px;padding:16px;border:1px solid var(--border);border-radius:8px;background:#fff}.avatar{width:48px;height:48px;border-radius:12px;object-fit:cover;border:1px solid var(--border);background:var(--line)}.avatar-fallback{display:grid;place-items:center;color:#fff;font-weight:900;font-size:20px}.account-name{font-size:20px;font-weight:800;word-break:break-word}.account-sub{color:var(--muted);font-size:13px;margin-top:2px}.field{margin-bottom:14px}label{display:block;color:#344054;font-weight:700;font-size:13px;margin-bottom:6px}input,textarea{width:100%;border:1px solid var(--border);border-radius:8px;padding:11px 12px;font:inherit;color:var(--text);background:#fff}textarea{min-height:120px;resize:vertical}input[readonly]{background:#f9fafb}.inline{display:flex;gap:10px}.inline input{min-width:0}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}button{border:0;border-radius:8px;padding:10px 14px;min-height:42px;font:inherit;font-weight:700;cursor:pointer}.primary{background:var(--line);color:#fff}.primary:hover{background:var(--line-dark)}.secondary{background:#eef2f6;color:var(--text)}.danger{background:var(--danger);color:#fff}button:disabled{cursor:not-allowed;opacity:.55}.notice,.error{border-radius:8px;padding:12px 14px;margin-bottom:16px}.notice{border:1px solid var(--ok-border);background:var(--ok);color:#05603a}.error{border:1px solid #fecdca;background:var(--danger-bg);color:var(--danger)}.intro{font-size:16px;margin-bottom:16px}.steps,.checks{margin:0;padding-left:22px}.steps li,.checks li{margin:8px 0}.admin-note{margin-bottom:16px}.spaced{margin-top:14px}@media(max-width:720px){main{width:min(100vw - 24px,920px);padding:20px 0}.topbar{flex-direction:column}.inline{flex-direction:column}.account{align-items:flex-start}.pill{font-size:14px}}
 </style>
 </head>
 <body>
 <main>
   <div class="topbar">
-    <div><h1>LINE Connection</h1><div class="tenant">Location ${escapeHtml(input.locationId)}</div></div>
+    <div><h1>LINE Official Account</h1><div class="tenant">Location ${escapeHtml(input.locationId)}</div></div>
     <span class="pill ${statusClass}">${statusLabel}</span>
   </div>
   ${input.statusMessage ? `<div class="notice">${escapeHtml(input.statusMessage)}</div>` : ""}
   ${input.errorMessage ? `<div class="error">${escapeHtml(input.errorMessage)}</div>` : ""}
-  <section class="panel">
-    <h2>Connection</h2>
-    <div class="grid">
-      <div class="metric"><div class="metric-label">Status</div><div class="metric-value">${statusLabel}</div></div>
-      <div class="metric"><div class="metric-label">Access token length</div><div class="metric-value">${input.settings.channel_access_token_length}</div></div>
-      <div class="metric"><div class="metric-label">Channel secret length</div><div class="metric-value">${input.settings.channel_secret_length}</div></div>
-    </div>
-  </section>
-  <section class="panel">
-    <h2>Webhook URL</h2>
-    <div class="inline">
-      <input id="webhook-url" readonly value="${escapeHtml(webhookUrl)}" placeholder="Connect LINE to generate a webhook URL">
-      <button class="secondary" type="button" id="copy-webhook" ${webhookUrl ? "" : "disabled"}>Copy</button>
-    </div>
-    <p class="help">Paste this URL into LINE Developers as the Messaging API webhook URL.</p>
-  </section>
-  <section class="panel">
-    <h2>Connect LINE Official Account</h2>
-    <form method="post" action="/app/line/page/connect" autocomplete="off">
-      <input type="hidden" name="locationId" value="${escapeHtml(input.locationId)}">
-      <input type="hidden" name="pageToken" value="${escapeHtml(input.pageToken)}">
-      <input type="hidden" name="actionToken" value="${escapeHtml(input.connectActionToken)}">
-      <div class="field"><label for="channel-access-token">Channel access token</label><textarea id="channel-access-token" name="channelAccessToken" required spellcheck="false" autocomplete="off"></textarea></div>
-      <div class="field"><label for="channel-secret">Channel secret</label><input id="channel-secret" name="channelSecret" type="password" required autocomplete="off"></div>
-      <div class="actions"><button class="primary" type="submit">Connect LINE</button></div>
-    </form>
-  </section>
-  <section class="panel">
-    <h2>Disconnect</h2>
-    <form method="post" action="/app/line/page/disconnect">
-      <input type="hidden" name="locationId" value="${escapeHtml(input.locationId)}">
-      <input type="hidden" name="pageToken" value="${escapeHtml(input.pageToken)}">
-      <input type="hidden" name="actionToken" value="${escapeHtml(input.disconnectActionToken)}">
-      <div class="actions"><button class="danger" type="submit" ${input.settings.connected ? "" : "disabled"}>Disconnect LINE</button></div>
-    </form>
-  </section>
+  ${content}
 </main>
 <script nonce="${input.scriptNonce}">
 const copyButton=document.getElementById("copy-webhook");
@@ -304,6 +277,195 @@ copyButton?.addEventListener("click",async()=>{if(!webhookInput?.value)return;tr
 </script>
 </body>
 </html>`;
+}
+
+function getSafeHttpUrl(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    const parsedUrl = new URL(value);
+    return ["http:", "https:"].includes(parsedUrl.protocol) ? parsedUrl.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getLineBotAvatarDataUrl(pictureUrl: string | null | undefined): Promise<string | null> {
+  const safeUrl = getSafeHttpUrl(pictureUrl);
+
+  if (!safeUrl) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3000);
+  const maxAvatarBytes = 256 * 1024;
+
+  try {
+    const response = await fetch(safeUrl, { signal: controller.signal });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+
+    if (!contentType || !["image/jpeg", "image/png", "image/webp", "image/gif"].includes(contentType)) {
+      return null;
+    }
+
+    const contentLength = Number(response.headers.get("content-length") ?? 0);
+
+    if (contentLength > maxAvatarBytes) {
+      return null;
+    }
+
+    const imageBuffer = Buffer.from(await response.arrayBuffer());
+
+    if (imageBuffer.byteLength > maxAvatarBytes) {
+      return null;
+    }
+
+    return `data:${contentType};base64,${imageBuffer.toString("base64")}`;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function buildWebhookPanel(webhookUrl: string): string {
+  return `<section class="panel">
+    <h2>Webhook URL</h2>
+    <div class="inline">
+      <input id="webhook-url" readonly value="${escapeHtml(webhookUrl)}" placeholder="Connect LINE to generate a webhook URL">
+      <button class="secondary" type="button" id="copy-webhook" ${webhookUrl ? "" : "disabled"}>Copy</button>
+    </div>
+    <p class="help spaced">Paste this URL into LINE Developers as the Messaging API webhook URL.</p>
+  </section>`;
+}
+
+function buildConnectedView(input: {
+  locationId: string;
+  pageToken: string;
+  settings: LineConnectionSettings;
+  disconnectActionToken: string;
+  webhookUrl: string;
+  accountName: string;
+  basicId?: string | null;
+  avatarDataUrl: string | null;
+}): string {
+  return `${buildConnectedAccountPanel(input)}
+  ${buildWebhookPanel(input.webhookUrl)}
+  ${buildFinalCheckPanel()}
+  ${buildDisconnectPanel(input)}`;
+}
+
+function buildConnectedAccountPanel(input: {
+  accountName: string;
+  basicId?: string | null;
+  avatarDataUrl: string | null;
+}): string {
+  const avatar = input.avatarDataUrl
+    ? `<img class="avatar" src="${escapeHtml(input.avatarDataUrl)}" alt="">`
+    : `<div class="avatar avatar-fallback" aria-hidden="true">L</div>`;
+  const basicId = input.basicId ? `<div class="account-sub">${escapeHtml(input.basicId)}</div>` : "";
+
+  return `<section class="panel success">
+    <h2>Connected</h2>
+    <p class="intro">Your LINE Official Account is connected to this GHL location.</p>
+    <div class="account">
+      ${avatar}
+      <div>
+        <div class="small">Connected account</div>
+        <div class="account-name">${escapeHtml(input.accountName)}</div>
+        ${basicId}
+      </div>
+    </div>
+  </section>`;
+}
+
+function buildFinalCheckPanel(): string {
+  return `<section class="panel">
+    <h2>Final check</h2>
+    <ul class="checks">
+      <li>Send a message from LINE and confirm it appears in GHL Conversations.</li>
+      <li>Reply from GHL and confirm the message appears in LINE.</li>
+      <li>Run one Send LINE Message workflow test.</li>
+    </ul>
+  </section>`;
+}
+
+function buildDisconnectPanel(input: {
+  locationId: string;
+  pageToken: string;
+  disconnectActionToken: string;
+  settings: LineConnectionSettings;
+}): string {
+  return `<section class="panel danger-panel">
+    <h2>Danger area</h2>
+    <p class="help">Disconnecting stops LINE messages for this GHL location until LINE is connected again.</p>
+    <form method="post" action="/app/line/page/disconnect">
+      <input type="hidden" name="locationId" value="${escapeHtml(input.locationId)}">
+      <input type="hidden" name="pageToken" value="${escapeHtml(input.pageToken)}">
+      <input type="hidden" name="actionToken" value="${escapeHtml(input.disconnectActionToken)}">
+      <div class="actions"><button class="danger" type="submit" ${input.settings.connected ? "" : "disabled"}>Disconnect LINE</button></div>
+    </form>
+  </section>`;
+}
+
+function buildNotConnectedView(input: {
+  locationId: string;
+  pageToken: string;
+  connectActionToken: string;
+  webhookUrl: string;
+}): string {
+  return `<section class="panel">
+    <h2>Not connected</h2>
+    <p class="intro">Connect your LINE Official Account to send and receive LINE messages inside GHL.</p>
+  </section>
+  ${buildSetupGuidePanel()}
+  ${buildAdminSetupPanel(input)}
+  ${buildWebhookPanel(input.webhookUrl)}`;
+}
+
+function buildSetupGuidePanel(): string {
+  return `<section class="panel">
+    <h2>Setup guide</h2>
+    <ol class="steps">
+      <li>Open LINE Official Account Manager.</li>
+      <li>Go to Settings &gt; Messaging API.</li>
+      <li>Open LINE Developers Console.</li>
+      <li>Copy the Channel secret.</li>
+      <li>Go to Messaging API tab and copy the Channel access token.</li>
+      <li>Paste both values into Admin setup and click Connect LINE.</li>
+      <li>Copy the Webhook URL from this page.</li>
+      <li>Paste it into LINE Developers &gt; Messaging API &gt; Webhook URL.</li>
+      <li>Turn ON "Use webhook".</li>
+      <li>Send a test message from LINE and confirm it appears in GHL Conversations.</li>
+    </ol>
+  </section>`;
+}
+
+function buildAdminSetupPanel(input: {
+  locationId: string;
+  pageToken: string;
+  connectActionToken: string;
+}): string {
+  return `<section class="panel">
+    <h2>Admin setup</h2>
+    <p class="help admin-note">Paste the Channel access token and Channel secret from LINE Developers Console.</p>
+    <form method="post" action="/app/line/page/connect" autocomplete="off">
+      <input type="hidden" name="locationId" value="${escapeHtml(input.locationId)}">
+      <input type="hidden" name="pageToken" value="${escapeHtml(input.pageToken)}">
+      <input type="hidden" name="actionToken" value="${escapeHtml(input.connectActionToken)}">
+      <div class="field"><label for="channel-access-token">Channel access token</label><textarea id="channel-access-token" name="channelAccessToken" required spellcheck="false" autocomplete="off"></textarea></div>
+      <div class="field"><label for="channel-secret">Channel secret</label><input id="channel-secret" name="channelSecret" type="password" required autocomplete="off"></div>
+      <div class="actions"><button class="primary" type="submit">Connect LINE</button></div>
+    </form>
+  </section>`;
 }
 
 appLinePageRouter.post("/app/line/page-link", requireSharedSecret, async (req, res, next) => {
