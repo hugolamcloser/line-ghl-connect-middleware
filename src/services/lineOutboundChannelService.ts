@@ -1,5 +1,4 @@
-import { getLineChannelById, getLineChannelByTenantId } from "./repository";
-import type { LineProfileRecord } from "./repository";
+import { getLineChannelById, getLineChannelByTenantId, type LineProfileRecord } from "./repository";
 
 export type ChannelTokenSource = "profile_channel" | "tenant_active_channel" | "env_fallback";
 
