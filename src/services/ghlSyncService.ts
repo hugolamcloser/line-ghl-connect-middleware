@@ -1,22 +1,12 @@
 import { logger } from "../config/logger";
 import { pushLineTextMessage } from "../integrations/lineClient";
+import { HttpError } from "../middleware/errors";
 import type { NormalizedGhlOutboundMessage } from "../types/ghl";
 import {
-  ensureDefaultTenant,
-  findLineProfileByGhlIds,
-  getActiveLineChannelByTenantId,
-  getLineChannelById,
-  saveMessageEvent
-} from "./repository";
-import type { LineProfileRecord } from "./repository";
-
-type ChannelTokenSource = "profile_channel" | "tenant_active_channel" | "env_fallback";
-
-type LineChannelSelection = {
-  channelAccessToken?: string;
-  lineChannelId?: string;
-  channelTokenSource: ChannelTokenSource;
-};
+  isLineChannelNotConnectedError,
+  resolveLineChannelForOutbound
+} from "./lineOutboundChannelService";
+import { ensureDefaultTenant, findLineProfileByGhlIds, saveMessageEvent } from "./repository";
 
 function getString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
@@ -42,50 +32,6 @@ function getAttachments(value: unknown): string[] {
   }
 
   return value.filter((item): item is string => typeof item === "string");
-}
-
-function hasUsableChannelAccessToken(value: string | null | undefined): value is string {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-async function resolveLineChannelForOutbound(
-  tenantId: string,
-  mapping: LineProfileRecord
-): Promise<LineChannelSelection> {
-  if (mapping.line_channel_id) {
-    try {
-      const profileChannel = await getLineChannelById(mapping.line_channel_id);
-
-      if (profileChannel?.is_active && hasUsableChannelAccessToken(profileChannel.channel_access_token)) {
-        return {
-          channelAccessToken: profileChannel.channel_access_token,
-          lineChannelId: profileChannel.id,
-          channelTokenSource: "profile_channel"
-        };
-      }
-    } catch {
-      // Keep outbound delivery resilient; the caller logs the final token source.
-    }
-  }
-
-  try {
-    const tenantChannel = await getActiveLineChannelByTenantId(tenantId);
-
-    if (tenantChannel?.is_active && hasUsableChannelAccessToken(tenantChannel.channel_access_token)) {
-      return {
-        channelAccessToken: tenantChannel.channel_access_token,
-        lineChannelId: tenantChannel.id,
-        channelTokenSource: "tenant_active_channel"
-      };
-    }
-  } catch {
-    // Keep existing env-token behavior if Supabase channel lookup is unavailable.
-  }
-
-  return {
-    lineChannelId: mapping.line_channel_id ?? undefined,
-    channelTokenSource: "env_fallback"
-  };
 }
 
 export function normalizeGhlOutboundMessage(payload: Record<string, unknown>): NormalizedGhlOutboundMessage {
@@ -158,7 +104,45 @@ export async function processGhlOutboundWebhook(payload: Record<string, unknown>
     return { status: "skipped", reason: "No LINE mapping found" };
   }
 
-  const lineChannelSelection = await resolveLineChannelForOutbound(tenantId, mapping);
+  const lineChannelSelection = await resolveLineChannelForOutbound(tenantId, mapping).catch(async (error) => {
+    if (!isLineChannelNotConnectedError(error)) {
+      throw error;
+    }
+
+    await saveMessageEvent({
+      tenantId,
+      provider: "ghl",
+      direction: "outbound",
+      externalMessageId: message.messageId,
+      lineUserId: mapping.line_user_id,
+      ghlConversationId: message.conversationId,
+      payload,
+      status: "failed",
+      errorMessage: error.message,
+      requestPayload: {
+        source: "ghl_outbound_provider",
+        contactId: message.contactId ?? mapping.ghl_contact_id ?? null,
+        conversationId: message.conversationId ?? mapping.ghl_conversation_id ?? null,
+        lineChannelId: error.lineChannelId ?? mapping.line_channel_id ?? null,
+        channelTokenSource: error.channelTokenSource,
+        channelConnected: false
+      }
+    });
+
+    logger.warn(
+      {
+        tenantId,
+        contactId: message.contactId ?? mapping.ghl_contact_id ?? undefined,
+        conversationId: message.conversationId ?? mapping.ghl_conversation_id ?? undefined,
+        lineProfileFound: true,
+        lineChannelId: error.lineChannelId ?? mapping.line_channel_id ?? undefined,
+        channelTokenSource: error.channelTokenSource
+      },
+      "Blocked HighLevel outbound message because LINE channel is not connected"
+    );
+
+    throw new HttpError(409, error.message);
+  });
 
   logger.info(
     {
