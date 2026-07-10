@@ -3,12 +3,7 @@ import { logger } from "../config/logger";
 import { getSupabase } from "../config/supabase";
 import { getLineBotInfo, validateLineChannelAccessToken } from "../integrations/lineClient";
 import { HttpError } from "../middleware/errors";
-
-type TenantRecord = {
-  id: string;
-  location_id: string;
-  updated_at?: string | null;
-};
+import { ensureTenantForLocation, type TenantRecord } from "./repository";
 
 type LineChannelRecord = {
   id: string;
@@ -107,22 +102,8 @@ async function toSettings(channel: LineChannelRecord | null, publicBaseUrl: stri
   };
 }
 
-async function getTenantByLocationId(locationId: string): Promise<TenantRecord | null> {
-  const normalizedLocationId = normalizeLocationId(locationId);
-  const supabase = getSupabase();
-  const { data, error } = await supabase
-    .from("tenants")
-    .select("id, location_id, updated_at")
-    .eq("location_id", normalizedLocationId)
-    .order("updated_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(error.message);
-  }
-
-  return data as TenantRecord | null;
+async function ensureTenantByLocationId(locationId: string): Promise<TenantRecord> {
+  return await ensureTenantForLocation(normalizeLocationId(locationId));
 }
 
 async function getLineChannelByTenantId(tenantId: string): Promise<LineChannelRecord | null> {
@@ -193,12 +174,7 @@ export async function getLineConnectionSettings(input: {
   locationId: string;
   publicBaseUrl: string;
 }): Promise<LineConnectionSettings> {
-  const tenant = await getTenantByLocationId(input.locationId);
-
-  if (!tenant) {
-    return await toSettings(null, input.publicBaseUrl);
-  }
-
+  const tenant = await ensureTenantByLocationId(input.locationId);
   const channel = await getLineChannelByTenantId(tenant.id);
 
   logger.info(
@@ -237,12 +213,7 @@ export async function connectLineChannel(input: {
     throw new HttpError(400, "Invalid LINE channel access token");
   }
 
-  const tenant = await getTenantByLocationId(input.locationId);
-
-  if (!tenant) {
-    throw new HttpError(404, "Tenant not found for locationId");
-  }
-
+  const tenant = await ensureTenantByLocationId(input.locationId);
   const existingChannel = await getLineChannelByTenantId(tenant.id);
   const webhookKey = existingChannel?.webhook_key?.trim() || generateWebhookKey();
   const channel = await upsertLineChannelByTenantId({
@@ -271,12 +242,7 @@ export async function disconnectLineChannel(input: {
   locationId: string;
   publicBaseUrl: string;
 }): Promise<LineConnectionSettings> {
-  const tenant = await getTenantByLocationId(input.locationId);
-
-  if (!tenant) {
-    return await toSettings(null, input.publicBaseUrl);
-  }
-
+  const tenant = await ensureTenantByLocationId(input.locationId);
   const channel = await setLineChannelActiveByTenantId(tenant.id, false);
 
   logger.info(
