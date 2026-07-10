@@ -427,16 +427,25 @@ export async function ensureTenantForLocation(locationId: string): Promise<Tenan
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from("tenants")
-    .upsert(
-      {
-        location_id: normalizedLocationId,
-        ghl_provider_id: requireEnvValue("GHL_CUSTOM_PROVIDER_ID", env.GHL_CUSTOM_PROVIDER_ID),
-        line_channel_id: "default"
-      },
-      { onConflict: "location_id,ghl_provider_id,line_channel_id" }
-    )
+    .insert({
+      location_id: normalizedLocationId,
+      ghl_provider_id: requireEnvValue("GHL_CUSTOM_PROVIDER_ID", env.GHL_CUSTOM_PROVIDER_ID),
+      line_channel_id: "default"
+    })
     .select("*")
     .single();
+
+  if (error?.code === "23505") {
+    const concurrentExisting = await getTenantByLocationId(normalizedLocationId);
+
+    if (concurrentExisting) {
+      return concurrentExisting;
+    }
+  }
+
+  if (!error) {
+    logger.info({ locationId: normalizedLocationId }, "Auto-created tenant for GHL location");
+  }
 
   return requireSingle<TenantRecord>(data, error);
 }

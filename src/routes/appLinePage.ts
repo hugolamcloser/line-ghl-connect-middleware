@@ -12,6 +12,7 @@ import {
   getLineConnectionSettings,
   type LineConnectionSettings
 } from "../services/lineConnectionService";
+import { ensureTenantForLocation } from "../services/repository";
 
 type PageAction = "connect" | "disconnect";
 
@@ -471,6 +472,8 @@ function buildAdminSetupPanel(input: {
 appLinePageRouter.post("/app/line/page-link", requireSharedSecret, async (req, res, next) => {
   try {
     const input = pageLinkBodySchema.parse(req.body);
+    await ensureTenantForLocation(input.locationId);
+
     const { token, expiresAt } = createSignedToken({ kind: "page_access", locationId: input.locationId });
 
     res.json({
