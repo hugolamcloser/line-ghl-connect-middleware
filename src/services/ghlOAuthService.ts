@@ -33,6 +33,12 @@ type GhlOAuthTokenPayload = {
   [key: string]: unknown;
 };
 
+type SaveTokenPayloadFallbackMetadata = {
+  companyId?: string | null;
+  scopes?: string[] | null;
+  tokenType?: string | null;
+};
+
 export type GhlAuthContext = {
   mode: "oauth" | "private_integration";
   accessToken: string;
@@ -123,6 +129,14 @@ function parseScopes(payload: GhlOAuthTokenPayload): string[] {
 
   const scopes = getString(payload.scopes) ?? getString(payload.scope);
   return scopes ? scopes.split(/\s+/).filter(Boolean) : [];
+}
+
+function hasScopeMetadata(payload: GhlOAuthTokenPayload): boolean {
+  return Object.prototype.hasOwnProperty.call(payload, "scope") || Object.prototype.hasOwnProperty.call(payload, "scopes");
+}
+
+function normalizeScopes(scopes: string[] | null | undefined): string[] {
+  return (scopes ?? []).filter((scope): scope is string => typeof scope === "string" && scope.trim().length > 0);
 }
 
 function parseClaimScopes(value: unknown): string[] | undefined {
@@ -340,14 +354,17 @@ async function requestOAuthToken(entries: Record<string, string>): Promise<GhlOA
 async function saveTokenPayload(
   payload: GhlOAuthTokenPayload,
   fallbackLocationId?: string,
-  fallbackRefreshToken?: string
+  fallbackRefreshToken?: string,
+  fallbackMetadata: SaveTokenPayloadFallbackMetadata = {}
 ): Promise<GhlOAuthTokenRecord> {
   const accessToken = getString(payload.access_token);
   const refreshToken = getString(payload.refresh_token) ?? fallbackRefreshToken;
   const resolvedLocationId = resolveTokenLocationId(payload);
   const fallbackLocationIdValue = getString(fallbackLocationId);
   const locationId = resolvedLocationId ?? fallbackLocationIdValue;
-  const companyId = resolveTokenCompanyId(payload);
+  const companyId = resolveTokenCompanyId(payload) ?? getString(fallbackMetadata.companyId);
+  const scopes = hasScopeMetadata(payload) ? parseScopes(payload) : normalizeScopes(fallbackMetadata.scopes);
+  const tokenType = getString(payload.token_type) ?? getString(fallbackMetadata.tokenType);
 
   logger.info(
     {
@@ -406,8 +423,8 @@ async function saveTokenPayload(
       accessToken,
       refreshToken,
       expiresAt: getExpiresAt(payload),
-      scopes: parseScopes(payload),
-      tokenType: getString(payload.token_type)
+      scopes,
+      tokenType
     });
 
     logger.info({ locationId: token.location_id, companyId: token.company_id, tokenRowId: token.id }, "Supabase OAuth token upsert succeeded");
@@ -467,7 +484,11 @@ export async function refreshGhlOAuthToken(locationId = env.GHL_LOCATION_ID): Pr
     client_secret: requireEnvValue("GHL_OAUTH_CLIENT_SECRET", env.GHL_OAUTH_CLIENT_SECRET)
   });
 
-  return saveTokenPayload(payload, token.location_id, token.refresh_token);
+  return saveTokenPayload(payload, token.location_id, token.refresh_token, {
+    companyId: token.company_id,
+    scopes: token.scopes,
+    tokenType: token.token_type
+  });
 }
 
 export async function getGhlAuthContext(

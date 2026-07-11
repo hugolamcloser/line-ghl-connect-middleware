@@ -148,9 +148,24 @@ function mockTokenResponse(payload, inspectRequest) {
 }
 
 test("OAuth token storage and refresh stay isolated by location", async () => {
+  const locAToken = buildTokenRow("loc_A", "access_A", "refresh_A", {
+    tenant_id: "tenant_A",
+    company_id: "company_A",
+    scopes: ["oauth.readonly"],
+    token_type: "Bearer"
+  });
+  const originalLocA = JSON.parse(JSON.stringify(locAToken));
   const rows = new Map([
-    ["loc_A", buildTokenRow("loc_A", "access_A", "refresh_A", { tenant_id: "tenant_A" })],
-    ["loc_B", buildTokenRow("loc_B", "access_B", "refresh_B", { tenant_id: "tenant_B" })]
+    ["loc_A", locAToken],
+    [
+      "loc_B",
+      buildTokenRow("loc_B", "access_B", "refresh_B", {
+        tenant_id: "tenant_B",
+        company_id: "company_B",
+        scopes: ["oauth.readonly", "oauth.write"],
+        token_type: "Bearer"
+      })
+    ]
   ]);
   setupOAuthRows(rows);
 
@@ -178,10 +193,11 @@ test("OAuth token storage and refresh stay isolated by location", async () => {
 
   const installStatus = await oauthService.exchangeGhlAuthorizationCode("mock-code-location-B");
   assert.equal(installStatus.location_id, "loc_B");
-  assert.equal(rows.get("loc_A").tenant_id, "tenant_A");
-  assert.equal(rows.get("loc_A").access_token, "access_A");
-  assert.equal(rows.get("loc_A").refresh_token, "refresh_A");
+  assert.deepEqual(rows.get("loc_A"), originalLocA);
   assert.equal(rows.get("loc_B").tenant_id, "tenant_B");
+  assert.equal(rows.get("loc_B").company_id, "company_B");
+  assert.deepEqual(rows.get("loc_B").scopes, ["oauth.readonly", "oauth.write"]);
+  assert.equal(rows.get("loc_B").token_type, "Bearer");
   assert.equal(rows.get("loc_B").access_token, "access_B_install");
   assert.equal(rows.get("loc_B").refresh_token, "refresh_B_install");
 
@@ -189,9 +205,7 @@ test("OAuth token storage and refresh stay isolated by location", async () => {
     {
       access_token: "access_B_refreshed",
       refresh_token: "refresh_B_refreshed",
-      expires_in: 3600,
-      scopes: ["oauth.readonly", "oauth.write"],
-      token_type: "Bearer"
+      expires_in: 3600
     },
     (init) => {
       const body = init.body.toString();
@@ -203,12 +217,33 @@ test("OAuth token storage and refresh stay isolated by location", async () => {
   const refreshed = await oauthService.refreshGhlOAuthToken("loc_B");
   assert.equal(refreshed.location_id, "loc_B");
   assert.equal(refreshed.tenant_id, "tenant_B");
-  assert.equal(rows.get("loc_A").tenant_id, "tenant_A");
-  assert.equal(rows.get("loc_A").access_token, "access_A");
-  assert.equal(rows.get("loc_A").refresh_token, "refresh_A");
+  assert.deepEqual(rows.get("loc_A"), originalLocA);
   assert.equal(rows.get("loc_B").tenant_id, "tenant_B");
+  assert.equal(rows.get("loc_B").company_id, "company_B");
+  assert.deepEqual(rows.get("loc_B").scopes, ["oauth.readonly", "oauth.write"]);
+  assert.equal(rows.get("loc_B").token_type, "Bearer");
   assert.equal(rows.get("loc_B").access_token, "access_B_refreshed");
   assert.equal(rows.get("loc_B").refresh_token, "refresh_B_refreshed");
+
+  mockTokenResponse({
+    access_token: "access_B_refreshed_with_metadata",
+    refresh_token: "refresh_B_refreshed_with_metadata",
+    expires_in: 3600,
+    company_id: "company_B_updated",
+    scopes: ["oauth.readonly"],
+    token_type: "BearerV2"
+  });
+
+  const refreshedWithMetadata = await oauthService.refreshGhlOAuthToken("loc_B");
+  assert.equal(refreshedWithMetadata.location_id, "loc_B");
+  assert.equal(refreshedWithMetadata.tenant_id, "tenant_B");
+  assert.deepEqual(rows.get("loc_A"), originalLocA);
+  assert.equal(rows.get("loc_B").tenant_id, "tenant_B");
+  assert.equal(rows.get("loc_B").company_id, "company_B_updated");
+  assert.deepEqual(rows.get("loc_B").scopes, ["oauth.readonly"]);
+  assert.equal(rows.get("loc_B").token_type, "BearerV2");
+  assert.equal(rows.get("loc_B").access_token, "access_B_refreshed_with_metadata");
+  assert.equal(rows.get("loc_B").refresh_token, "refresh_B_refreshed_with_metadata");
 
   mockTokenResponse({
     access_token: "access_without_location",
@@ -242,12 +277,13 @@ test("OAuth token storage and refresh stay isolated by location", async () => {
     /No HighLevel OAuth token is stored for location loc_missing/
   );
   assert.equal(rows.has("loc_unresolved"), false);
-  assert.equal(rows.get("loc_A").tenant_id, "tenant_A");
-  assert.equal(rows.get("loc_A").access_token, "access_A");
-  assert.equal(rows.get("loc_A").refresh_token, "refresh_A");
+  assert.deepEqual(rows.get("loc_A"), originalLocA);
   assert.equal(rows.get("loc_B").tenant_id, "tenant_B");
-  assert.equal(rows.get("loc_B").access_token, "access_B_refreshed");
-  assert.equal(rows.get("loc_B").refresh_token, "refresh_B_refreshed");
+  assert.equal(rows.get("loc_B").company_id, "company_B_updated");
+  assert.deepEqual(rows.get("loc_B").scopes, ["oauth.readonly"]);
+  assert.equal(rows.get("loc_B").token_type, "BearerV2");
+  assert.equal(rows.get("loc_B").access_token, "access_B_refreshed_with_metadata");
+  assert.equal(rows.get("loc_B").refresh_token, "refresh_B_refreshed_with_metadata");
 });
 
 test("LINE outbound channel selection stays isolated by tenant", async () => {
