@@ -43,7 +43,7 @@ function isSensitiveQueryKey(key: string): boolean {
   return sensitiveQueryKeys.has(key.toLowerCase());
 }
 
-function redactSensitiveUrlQuery(rawUrl: string | undefined): string | undefined {
+export function redactSensitiveUrlQuery(rawUrl: string | undefined): string | undefined {
   if (!rawUrl) {
     return rawUrl;
   }
@@ -96,7 +96,7 @@ function redactUrlHeaderValue(value: unknown): unknown {
   return value;
 }
 
-function redactRequestHeaders(headers: unknown): unknown {
+export function redactRequestHeaders(headers: unknown): unknown {
   if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
     return headers;
   }

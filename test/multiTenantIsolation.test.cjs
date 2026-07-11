@@ -1,5 +1,6 @@
 const { afterEach, test } = require("node:test");
 const assert = require("node:assert/strict");
+const http = require("node:http");
 
 process.env.NODE_ENV = "test";
 process.env.LOG_LEVEL = "silent";
@@ -18,6 +19,8 @@ const config = require("../dist/config/env");
 const repository = require("../dist/services/repository");
 const oauthService = require("../dist/services/ghlOAuthService");
 const lineOutbound = require("../dist/services/lineOutboundChannelService");
+const signatureVerifier = require("../dist/middleware/ghlWebhookSignature");
+const { createApp, redactRequestHeaders, redactSensitiveUrlQuery } = require("../dist/app");
 
 const repositoryMockKeys = [
   "ensureTenantForLocation",
@@ -41,6 +44,8 @@ const originalRepositoryExports = Object.fromEntries(
 );
 const originalFetch = global.fetch;
 const originalEnv = { ...config.env };
+const originalRecordGhlAppInstall = oauthService.recordGhlAppInstall;
+const originalVerifyGhlWebhookSignature = signatureVerifier.verifyGhlWebhookSignature;
 
 afterEach(() => {
   for (const [key, value] of Object.entries(originalRepositoryExports)) {
@@ -48,6 +53,8 @@ afterEach(() => {
   }
 
   Object.assign(config.env, originalEnv);
+  oauthService.recordGhlAppInstall = originalRecordGhlAppInstall;
+  signatureVerifier.verifyGhlWebhookSignature = originalVerifyGhlWebhookSignature;
   global.fetch = originalFetch;
 });
 
@@ -305,6 +312,228 @@ function locationPayload(locationId, suffix = locationId) {
   };
 }
 
+function requestApp(input) {
+  return new Promise((resolve, reject) => {
+    const app = createApp();
+    const server = app.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      const rawBody = typeof input.body === "string" ? input.body : JSON.stringify(input.body);
+      const request = http.request(
+        {
+          hostname: "127.0.0.1",
+          port: address.port,
+          path: input.path,
+          method: input.method ?? "POST",
+          headers: {
+            "content-type": "application/json",
+            "content-length": Buffer.byteLength(rawBody),
+            ...(input.headers ?? {})
+          }
+        },
+        (response) => {
+          const chunks = [];
+          response.on("data", (chunk) => chunks.push(chunk));
+          response.on("end", () => {
+            const responseText = Buffer.concat(chunks).toString("utf8");
+            server.close((closeError) => {
+              if (closeError) {
+                reject(closeError);
+                return;
+              }
+
+              resolve({
+                status: response.statusCode,
+                body: responseText ? JSON.parse(responseText) : null
+              });
+            });
+          });
+        }
+      );
+      request.on("error", (error) => server.close(() => reject(error)));
+      request.end(rawBody);
+    });
+    server.on("error", reject);
+  });
+}
+
+test("AppInstall entrypoint accepts a signed INSTALL payload and reaches reconciliation", async () => {
+  let reconciliationInput;
+  signatureVerifier.verifyGhlWebhookSignature = ({ rawBody, ghlSignature }) => {
+    assert.equal(ghlSignature, "signature-sensitive-value");
+    assert.match(rawBody.toString("utf8"), /loc_entry_valid/);
+    return true;
+  };
+  oauthService.recordGhlAppInstall = async (input) => {
+    reconciliationInput = input;
+    return {
+      status: "completed_locations",
+      locations: [{
+        location_id: input.locationId,
+        tenant_id: "tenant_entry_valid",
+        token_present: true,
+        refresh_token_present: true,
+        expires_at: "2999-01-01T00:00:00.000Z"
+      }],
+      failed_location_ids: [],
+      tenant_id: "tenant_entry_valid"
+    };
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "signature-sensitive-value" },
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1",
+      locationId: "loc_entry_valid",
+      webhookId: "entry-valid",
+      accessToken: "token-sensitive-value"
+    }
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.status, "completed_locations");
+  assert.equal(reconciliationInput.locationId, "loc_entry_valid");
+  assert.equal(reconciliationInput.deliveryKey, "webhook:entry-valid");
+  assert.doesNotMatch(JSON.stringify(response.body), /token-sensitive-value|signature-sensitive-value/);
+});
+
+test("AppInstall entrypoint rejects a missing signature before reconciliation", async () => {
+  oauthService.recordGhlAppInstall = async () => {
+    throw new Error("reconciliation must not run");
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1",
+      locationId: "loc_unsigned"
+    }
+  });
+
+  assert.equal(response.status, 401);
+  assert.equal(response.body.error, "Invalid HighLevel webhook signature");
+});
+
+test("AppInstall entrypoint rejects an invalid signature before reconciliation", async () => {
+  oauthService.recordGhlAppInstall = async () => {
+    throw new Error("reconciliation must not run");
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "invalid-signature" },
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1",
+      locationId: "loc_invalid_signature"
+    }
+  });
+
+  assert.equal(response.status, 401);
+  assert.equal(response.body.error, "Invalid HighLevel webhook signature");
+});
+
+test("AppInstall entrypoint ignores a signed payload for another appId", async () => {
+  signatureVerifier.verifyGhlWebhookSignature = () => true;
+  oauthService.recordGhlAppInstall = async () => {
+    throw new Error("reconciliation must not run");
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "valid-test-signature" },
+    body: {
+      type: "INSTALL",
+      appId: "other-app",
+      companyId: "company_1",
+      locationId: "loc_wrong_app"
+    }
+  });
+
+  assert.equal(response.status, 202);
+  assert.deepEqual(response.body, { ok: true, ignored: true, reason: "app_id_mismatch" });
+});
+
+test("AppInstall entrypoint rejects a signed INSTALL payload without locationId", async () => {
+  signatureVerifier.verifyGhlWebhookSignature = () => true;
+  oauthService.recordGhlAppInstall = async () => {
+    throw new Error("reconciliation must not run");
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "valid-test-signature" },
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1"
+    }
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.error, "Invalid HighLevel AppInstall payload");
+});
+
+test("AppInstall entrypoint keeps duplicate delivery idempotent end to end", async () => {
+  const store = setupOAuthStore();
+  store.sessions.set(store.sessionKey("marketplace-app", "company_1"), {
+    id: "session_entry_duplicate",
+    app_id: "marketplace-app",
+    company_id: "company_1",
+    access_token: "company_access",
+    status: "active",
+    expires_at: "2999-01-01T00:00:00.000Z",
+    last_reconciled_at: null,
+    error_code: null,
+    created_at: "2026-07-11T00:00:00.000Z",
+    updated_at: "2026-07-11T00:00:00.000Z"
+  });
+  signatureVerifier.verifyGhlWebhookSignature = () => true;
+  const calls = createFetchSequence([
+    locationTokenStep("loc_entry_duplicate", locationPayload("loc_entry_duplicate"))
+  ]);
+  const request = {
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "valid-test-signature" },
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1",
+      locationId: "loc_entry_duplicate",
+      webhookId: "entry-duplicate"
+    }
+  };
+
+  const first = await requestApp(request);
+  const second = await requestApp(request);
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(store.tokens.get("loc_entry_duplicate").tenant_id, "tenant_loc_entry_duplicate");
+});
+
+test("request logging redacts OAuth codes, tokens, and webhook signatures", () => {
+  const redactedUrl = redactSensitiveUrlQuery(
+    "/oauth/callback?code=authorization-sensitive&accessToken=token-sensitive"
+  );
+  const redactedHeaders = redactRequestHeaders({
+    authorization: "Bearer authorization-sensitive",
+    "x-ghl-signature": "signature-sensitive",
+    "x-wh-signature": "legacy-signature-sensitive"
+  });
+  const serialized = JSON.stringify({ redactedUrl, redactedHeaders });
+
+  assert.doesNotMatch(serialized, /authorization-sensitive|token-sensitive|signature-sensitive/);
+  assert.match(serialized, /\[redacted\]/);
+});
+
 test("direct Location OAuth creates the exact unknown tenant and token without GHL_LOCATION_ID", async () => {
   const store = setupOAuthStore();
   createFetchSequence([authCodeStep(locationPayload("loc_direct"))]);
@@ -317,6 +546,27 @@ test("direct Location OAuth creates the exact unknown tenant and token without G
   assert.equal(store.tenants.get("loc_direct").id, "tenant_loc_direct");
   assert.equal(store.tokens.get("loc_direct").tenant_id, "tenant_loc_direct");
   assert.equal(store.tokens.has("legacy_global_location"), false);
+});
+
+test("direct Location OAuth continues parsing snake_case token responses", async () => {
+  const store = setupOAuthStore();
+  createFetchSequence([authCodeStep({
+    access_token: "access_snake",
+    refresh_token: "refresh_snake",
+    expires_in: 3600,
+    location_id: "loc_snake",
+    company_id: "company_snake",
+    scope: "oauth.readonly oauth.write",
+    token_type: "Bearer"
+  })]);
+
+  const result = await oauthService.exchangeGhlAuthorizationCode("direct-snake-code");
+
+  assert.equal(result.mode, "direct_location");
+  assert.equal(result.location_id, "loc_snake");
+  assert.equal(store.tokens.get("loc_snake").tenant_id, "tenant_loc_snake");
+  assert.equal(store.tokens.get("loc_snake").company_id, "company_snake");
+  assert.deepEqual(store.tokens.get("loc_snake").scopes, ["oauth.readonly", "oauth.write"]);
 });
 
 test("Company callback before AppInstall waits, then converts only the newly installed location", async () => {
@@ -467,6 +717,57 @@ test("location-token response mismatch fails closed without modifying unrelated 
   assert.deepEqual(store.tokens.get("loc_unrelated"), original);
 });
 
+test("location-token response without access token fails closed", async () => {
+  const store = setupOAuthStore();
+  await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app",
+    companyId: "company_1",
+    locationId: "loc_missing_access",
+    deliveryKey: "webhook:missing-access"
+  });
+  createFetchSequence([
+    authCodeStep(companyPayload()),
+    locationTokenStep("loc_missing_access", {
+      refreshToken: "refresh_missing_access",
+      expiresIn: 3600,
+      locationId: "loc_missing_access",
+      companyId: "company_1",
+      scope: "oauth.readonly",
+      tokenType: "Bearer"
+    })
+  ]);
+
+  const result = await oauthService.exchangeGhlAuthorizationCode("missing-access-code");
+
+  assert.equal(result.status, "failed");
+  assert.equal(store.tokens.has("loc_missing_access"), false);
+});
+
+test("Company OAuth response without companyId fails safely", async () => {
+  const store = setupOAuthStore();
+  createFetchSequence([authCodeStep(companyPayload({ companyId: undefined }))]);
+
+  await assert.rejects(
+    () => oauthService.exchangeGhlAuthorizationCode("missing-company-code"),
+    /did not include companyId/
+  );
+  assert.equal(store.sessions.size, 0);
+  assert.equal(store.tokens.size, 0);
+});
+
+test("Company OAuth correlation fails safely without GHL_MARKETPLACE_APP_ID", async () => {
+  const store = setupOAuthStore();
+  config.env.GHL_MARKETPLACE_APP_ID = "";
+  createFetchSequence([authCodeStep(companyPayload())]);
+
+  await assert.rejects(
+    () => oauthService.exchangeGhlAuthorizationCode("missing-marketplace-app-code"),
+    /GHL_MARKETPLACE_APP_ID is required/
+  );
+  assert.equal(store.sessions.size, 0);
+  assert.equal(store.tokens.size, 0);
+});
+
 test("missing Company onboarding session leaves exact install pending and stores no token", async () => {
   const store = setupOAuthStore();
   const result = await oauthService.recordGhlAppInstall({
@@ -511,7 +812,49 @@ test("OAuth refresh remains scoped to the stored location and preserves omitted 
   assert.deepEqual(store.tokens.get("loc_A"), originalA);
   assert.equal(store.tokens.get("loc_B").tenant_id, "tenant_loc_B");
   assert.equal(store.tokens.get("loc_B").company_id, "company_B");
+  assert.deepEqual(store.tokens.get("loc_B").scopes, ["oauth.readonly", "oauth.write"]);
+  assert.equal(store.tokens.get("loc_B").token_type, "Bearer");
   assert.equal(store.tokens.get("loc_B").access_token, "access_B_refreshed");
+  assert.equal(store.tokens.get("loc_B").refresh_token, "refresh_B_refreshed");
+});
+
+test("OAuth refresh stores supplied metadata for the same location only", async () => {
+  const locA = buildTokenRow("loc_A", "access_A", "refresh_A", {
+    company_id: "company_A",
+    scopes: ["oauth.readonly"],
+    token_type: "Bearer"
+  });
+  const locB = buildTokenRow("loc_B", "access_B", "refresh_B", {
+    company_id: "company_B",
+    scopes: ["oauth.readonly", "oauth.write"],
+    token_type: "Bearer"
+  });
+  const originalA = clone(locA);
+  const store = setupOAuthStore({ initialTokens: [["loc_A", locA], ["loc_B", locB]] });
+  createFetchSequence([{
+    payload: {
+      accessToken: "access_B_refreshed_with_metadata",
+      refreshToken: "refresh_B_refreshed_with_metadata",
+      expiresIn: 3600,
+      companyId: "company_B_updated",
+      scopes: ["oauth.readonly"],
+      tokenType: "BearerV2"
+    },
+    assert: (call) => {
+      assert.match(call.body, /grant_type=refresh_token/);
+      assert.match(call.body, /refresh_token=refresh_B/);
+    }
+  }]);
+
+  await oauthService.refreshGhlOAuthToken("loc_B");
+
+  assert.deepEqual(store.tokens.get("loc_A"), originalA);
+  assert.equal(store.tokens.get("loc_B").tenant_id, "tenant_loc_B");
+  assert.equal(store.tokens.get("loc_B").company_id, "company_B_updated");
+  assert.deepEqual(store.tokens.get("loc_B").scopes, ["oauth.readonly"]);
+  assert.equal(store.tokens.get("loc_B").token_type, "BearerV2");
+  assert.equal(store.tokens.get("loc_B").access_token, "access_B_refreshed_with_metadata");
+  assert.equal(store.tokens.get("loc_B").refresh_token, "refresh_B_refreshed_with_metadata");
 });
 
 test("missing OAuth token fails safely without selecting another tenant token", async () => {
@@ -537,10 +880,25 @@ test("LINE outbound channel selection remains tenant-isolated and fails closed",
   repository.getLineChannelByTenantId = async (tenantId) =>
     [...channels.values()].find((channel) => channel.tenant_id === tenantId) ?? null;
 
-  const selected = await lineOutbound.resolveLineChannelForOutbound("tenant_B", { line_channel_id: "line_B" });
-  assert.equal(selected.channelAccessToken, "line_token_B");
+  const profileChannelSelection = await lineOutbound.resolveLineChannelForOutbound("tenant_B", {
+    line_channel_id: "line_B"
+  });
+  assert.equal(profileChannelSelection.channelAccessToken, "line_token_B");
+  assert.equal(profileChannelSelection.channelTokenSource, "profile_channel");
+
+  const tenantChannelSelection = await lineOutbound.resolveLineChannelForOutbound("tenant_B", {
+    line_channel_id: null
+  });
+  assert.equal(tenantChannelSelection.channelAccessToken, "line_token_B");
+  assert.equal(tenantChannelSelection.channelTokenSource, "tenant_active_channel");
+
   await assert.rejects(
     () => lineOutbound.resolveLineChannelForOutbound("tenant_missing", { line_channel_id: null }),
-    (error) => error.name === "LineChannelNotConnectedError"
+    (error) => {
+      assert.equal(error.name, "LineChannelNotConnectedError");
+      assert.equal(error.channelTokenSource, "tenant_active_channel");
+      assert.equal(error.lineChannelId, undefined);
+      return true;
+    }
   );
 });
