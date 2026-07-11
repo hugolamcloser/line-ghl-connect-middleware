@@ -11,6 +11,7 @@ export type GhlContactResponse = {
 };
 
 export type GhlInboundMessageInput = {
+  tenantId?: string;
   contactId: string;
   locationId?: string;
   conversationProviderId?: string;

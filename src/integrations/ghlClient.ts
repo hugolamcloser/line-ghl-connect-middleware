@@ -41,6 +41,7 @@ export class GhlApiError extends Error {
 }
 
 const providerNoAccessCanonicalCode = "CONVERSATIONS_MSG_PROVIDER_NO_ACCESS";
+const requiredInboundSendAuthMode = "oauth" satisfies GhlInboundSendAuthMode;
 let providerConfigWarningLogged = false;
 type GhlInboundSendAuthMode = "oauth" | "private_integration";
 
@@ -122,19 +123,7 @@ function getConfiguredInboundSendAuthMode(): GhlInboundSendAuthMode {
   return env.GHL_INBOUND_SEND_AUTH_MODE;
 }
 
-function getPrivateIntegrationAuthContext(locationId: string): GhlAuthContext {
-  return {
-    mode: "private_integration",
-    accessToken: requireEnvValue("GHL_PRIVATE_INTEGRATION_TOKEN", env.GHL_PRIVATE_INTEGRATION_TOKEN),
-    locationId
-  };
-}
-
 async function getInboundSendAuthContext(locationId: string): Promise<GhlAuthContext> {
-  if (getConfiguredInboundSendAuthMode() === "private_integration") {
-    return getPrivateIntegrationAuthContext(locationId);
-  }
-
   return getGhlAuthContext(locationId, { allowPrivateFallback: false });
 }
 
@@ -249,9 +238,11 @@ function getGhlErrorDetails(responseBody: unknown): { canonicalCode?: string; me
 }
 
 function buildInboundMessagePayload(input: GhlInboundMessageInput) {
-  const conversationProviderId = getConfiguredConversationProviderId();
+  const locationId = input.locationId?.trim() || requireEnvValue("GHL_LOCATION_ID", env.GHL_LOCATION_ID);
+  const conversationProviderId = input.conversationProviderId?.trim() || getConfiguredConversationProviderId();
+
   return {
-    locationId: requireEnvValue("GHL_LOCATION_ID", env.GHL_LOCATION_ID),
+    locationId,
     contactId: input.contactId,
     conversationId: input.conversationId,
     conversationProviderId,
@@ -510,6 +501,10 @@ export async function sendInboundMessageToGhl(input: GhlInboundMessageInput): Pr
 
   try {
     let auth = await getInboundSendAuthContext(payload.locationId);
+
+    if (auth.mode !== requiredInboundSendAuthMode) {
+      throw new Error(`Invalid real inbound send path auth: expected ${requiredInboundSendAuthMode} but selected ${auth.mode}`);
+    }
 
     logger.info(
       {

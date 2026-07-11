@@ -391,6 +391,7 @@ export async function processLineWebhookEvent(event: LineWebhookEvent, context: 
 
       const sendInboundMessage = () =>
         sendInboundMessageToGhl({
+          tenantId,
           contactId: record.ghl_contact_id as string,
           locationId: ghlConfig.locationId,
           conversationProviderId: ghlConfig.providerId,
@@ -467,6 +468,11 @@ export async function processLineWebhookEvent(event: LineWebhookEvent, context: 
 
       logger.info(
         {
+          tenantId,
+          locationId: ghlConfig.locationId,
+          ghlProviderId: ghlConfig.providerId,
+          authModeUsed: requestPayload.actual_auth_mode_used,
+          ghlStatusCode: requestPayload.statusCode,
           lineUserId,
           lineMessageId,
           ghlContactId: record.ghl_contact_id,
@@ -485,6 +491,9 @@ export async function processLineWebhookEvent(event: LineWebhookEvent, context: 
 
       logger.error(
         {
+          tenantId,
+          locationId: ghlConfig.locationId,
+          ghlProviderId: ghlConfig.providerId,
           lineUserId,
           lineMessageId,
           error: serializedError,
@@ -494,6 +503,11 @@ export async function processLineWebhookEvent(event: LineWebhookEvent, context: 
           ghlPath: serializedError.path,
           ghlMethod: serializedError.method,
           authMode: serializedError.authMode,
+          authModeUsed: serializedError.authMode,
+          shortGhlErrorMessage:
+            requestPayload && typeof requestPayload === "object" && !Array.isArray(requestPayload)
+              ? (requestPayload as Record<string, unknown>).short_ghl_error_message
+              : undefined,
           messageEventStatus: "failed"
         },
         "Failed to sync LINE inbound message to HighLevel"
@@ -519,6 +533,9 @@ export async function processLineWebhookEvent(event: LineWebhookEvent, context: 
 
       logger.error(
         {
+          tenantId,
+          locationId: ghlConfig.locationId,
+          ghlProviderId: ghlConfig.providerId,
           lineUserId,
           lineMessageId,
           ghlStatusCode: serializedError.statusCode,
@@ -526,6 +543,11 @@ export async function processLineWebhookEvent(event: LineWebhookEvent, context: 
           ghlPath: serializedError.path,
           ghlMethod: serializedError.method,
           authMode: serializedError.authMode,
+          authModeUsed: serializedError.authMode,
+          shortGhlErrorMessage:
+            requestPayload && typeof requestPayload === "object" && !Array.isArray(requestPayload)
+              ? (requestPayload as Record<string, unknown>).short_ghl_error_message
+              : undefined,
           messageEventStatus: "failed"
         },
         "Saved failed LINE inbound message event"

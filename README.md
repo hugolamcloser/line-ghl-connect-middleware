@@ -58,7 +58,7 @@ Important production values:
 - `GHL_INBOUND_MESSAGE_TYPE`: HighLevel inbound message `type`. The confirmed production LINE setup uses `Custom`.
 - `GHL_SEND_CONVERSATION_PROVIDER_ID`: Set to `true` for the confirmed production LINE provider setup so `conversationProviderId` is sent to HighLevel.
 - `GHL_LOCATION_API_AUTH_MODE`: Auth mode for LINE inbound location-level writes: contact create, contact fetch/update, tags, and optional custom fields. The confirmed production setup uses `private_integration`.
-- `GHL_INBOUND_SEND_AUTH_MODE`: Auth mode used only for `POST /conversations/messages/inbound`. The confirmed production setup uses `oauth`.
+- `GHL_INBOUND_SEND_AUTH_MODE`: Legacy diagnostic/config visibility for `POST /conversations/messages/inbound`. The real inbound send path is forced to the stored location OAuth token.
 - `GHL_OAUTH_CLIENT_ID`, `GHL_OAUTH_CLIENT_SECRET`, and `GHL_OAUTH_REDIRECT_URI`: HighLevel Marketplace app OAuth settings. Production LINE to GHL forwarding uses the installed location OAuth token stored in Supabase.
 - `GHL_LINE_USER_ID_FIELD_ID`: Optional GHL custom field ID for storing the LINE user ID.
 - `GHL_LINE_DISPLAY_NAME_FIELD_ID`: Optional GHL custom field ID for storing the LINE display name.
@@ -104,7 +104,7 @@ Optional variables:
 Deprecated, testing-only, or migration-only variables:
 
 - `GHL_ALLOW_PRIVATE_TOKEN_FALLBACK`: Deprecated fallback path. Keep `false` in production.
-- `GHL_INBOUND_SEND_AUTH_MODE=private_integration`: Testing/migration option only. The confirmed production inbound send mode is `oauth`.
+- `GHL_INBOUND_SEND_AUTH_MODE=private_integration`: Deprecated. Real inbound forwarding ignores this value and uses OAuth for `POST /conversations/messages/inbound`.
 - `GHL_INBOUND_MESSAGE_TYPE=SMS`: Old testing value. The confirmed production value is `Custom`.
 - `GHL_SEND_CONVERSATION_PROVIDER_ID=false`: Old testing value. The confirmed production value is `true`.
 
@@ -117,7 +117,7 @@ These settings are part of the confirmed working production wiring. Keep them un
 - `GHL_CUSTOM_PROVIDER_ID`: Must remain the active GHL Conversation Provider ID for this location.
 - `GHL_INBOUND_MESSAGE_TYPE=Custom`: The working inbound message payload uses HighLevel type `Custom`.
 - `GHL_SEND_CONVERSATION_PROVIDER_ID=true`: The working inbound message payload includes `conversationProviderId`.
-- `GHL_INBOUND_SEND_AUTH_MODE=oauth`: The working inbound message send uses the installed Location OAuth token.
+- `GHL_INBOUND_SEND_AUTH_MODE=oauth`: The working inbound message send uses the installed Location OAuth token. The runtime enforces OAuth for this endpoint.
 - `GHL_LOCATION_API_AUTH_MODE=private_integration`: The working contact create/update/tag/custom-field path uses the Private Integration token.
 - LINE webhook URL: `https://win-line-connect-production.up.railway.app/webhooks/line/inbound`
 - GHL Conversation Provider Delivery URL: `https://win-line-connect-production.up.railway.app/webhooks/ghl/line/outbound`
@@ -252,7 +252,7 @@ The inbound message client posts to:
 POST /conversations/messages/inbound
 ```
 
-with the configured `Version` header. By default, the middleware uses the stored Marketplace OAuth access token for the location. If the OAuth access token is expired or close to expiry, the middleware refreshes it and retries a 401 once. `GHL_LOCATION_API_AUTH_MODE` controls LINE inbound contact create/update/tag/custom-field calls. `GHL_INBOUND_SEND_AUTH_MODE` controls only the real `POST /conversations/messages/inbound` send call. OAuth install, OAuth callback, and OAuth refresh/storage stay on the OAuth path.
+with the configured `Version` header. The middleware uses the stored Marketplace OAuth access token for the location. If the OAuth access token is expired or close to expiry, the middleware refreshes it and retries a 401 once. `GHL_LOCATION_API_AUTH_MODE` controls LINE inbound contact create/update/tag/custom-field calls. `GHL_INBOUND_SEND_AUTH_MODE` is retained for diagnostics/backward compatibility, but real `POST /conversations/messages/inbound` forwarding is forced to OAuth because this endpoint rejects the private integration auth class. OAuth install, OAuth callback, and OAuth refresh/storage stay on the OAuth path.
 
 For the confirmed production LINE provider, the payload uses `type: "Custom"` and includes `conversationProviderId`. Use `GHL_INBOUND_MESSAGE_TYPE` only to match the provider type configured in HighLevel.
 
@@ -260,9 +260,9 @@ If `/debug/oauth-status` shows `token_present: true` and `refresh_token_present:
 
 If HighLevel returns `This authClass type is not allowed to access this scope`, the OAuth token can exist and still be rejected by the inbound-message API. Check that the Marketplace app version installed in the location includes the Conversation Provider module, that the provider was created under that same app/version, that the location has the provider installed under Settings > Conversation Providers, and that `GHL_INBOUND_MESSAGE_TYPE` matches the provider type.
 
-If support asks for deeper diagnostics, `/debug/ghl-inbound-message-auth-matrix-test` can compare OAuth and Private Integration behavior without changing production behavior. The confirmed production setup uses OAuth for inbound send, so do not switch auth modes unless you are migrating or HighLevel behavior changes.
+If support asks for deeper diagnostics, `/debug/ghl-inbound-message-auth-matrix-test` can compare OAuth and Private Integration behavior without changing production behavior. Real inbound forwarding remains forced to OAuth for this endpoint.
 
-The Conversation Provider Delivery URL is only for GHL to middleware outbound messages. LINE inbound messages come from the LINE webhook and are then written into GHL through the LeadConnector API using the auth modes selected by `GHL_LOCATION_API_AUTH_MODE` and `GHL_INBOUND_SEND_AUTH_MODE`. Marketplace webhooks are separate from the Conversation Provider Delivery URL and are not required for this app unless you add separate GHL event-notification features.
+The Conversation Provider Delivery URL is only for GHL to middleware outbound messages. LINE inbound messages come from the LINE webhook and are then written into GHL through the LeadConnector API using `GHL_LOCATION_API_AUTH_MODE` for contact writes and the stored location OAuth token for `POST /conversations/messages/inbound`. Marketplace webhooks are separate from the Conversation Provider Delivery URL and are not required for this app unless you add separate GHL event-notification features.
 
 ## Mapping A LINE User To A GHL Contact
 
@@ -322,7 +322,7 @@ Returns the configured `GHL_CUSTOM_PROVIDER_ID`, whether it exactly equals `GHL_
 
 ### `GET /debug/inbound-send-auth-config`
 
-Returns the production inbound send auth setting without secrets: `GHL_INBOUND_SEND_AUTH_MODE`, `GHL_LOCATION_API_AUTH_MODE`, effective inbound send auth mode, whether a Private Integration token is present, provider ID, location ID, and inbound message type.
+Returns the production inbound send auth setting without secrets: configured `GHL_INBOUND_SEND_AUTH_MODE`, `GHL_LOCATION_API_AUTH_MODE`, effective inbound send auth mode, whether a Private Integration token is present, provider ID, location ID, and inbound message type. Effective inbound send auth should be `oauth`.
 
 ### `GET /debug/ghl-provider-test`
 
@@ -334,7 +334,7 @@ Uses the stored OAuth token, configured `GHL_CUSTOM_PROVIDER_ID`, and configured
 
 ### `GET /debug/ghl-inbound-send-auth-test`
 
-Uses the same safe fake inbound-message payload as the endpoint test, but sends it with the auth mode configured by `GHL_INBOUND_SEND_AUTH_MODE`. Use this before a real LINE test after switching to `private_integration`. A `400 CONVERSATIONS_CONTACT_NOT_FOUND` is expected with the fake contact ID and usually means the configured auth mode reached HighLevel payload validation.
+Uses the same safe fake inbound-message payload as the endpoint test, reports the configured `GHL_INBOUND_SEND_AUTH_MODE`, and sends with the required OAuth mode. A `400 CONVERSATIONS_CONTACT_NOT_FOUND` is expected with the fake contact ID and usually means OAuth reached HighLevel payload validation.
 
 ### `GET /debug/ghl-contact-auth-test`
 
@@ -342,7 +342,7 @@ Creates and updates a safe debug contact using `GHL_LOCATION_API_AUTH_MODE`. It 
 
 ### `GET /debug/ghl-inbound-message-auth-matrix-test`
 
-Uses the same safe fake inbound-message payload and compares HighLevel responses for stored Marketplace OAuth and Private Integration auth when `GHL_PRIVATE_INTEGRATION_TOKEN` is configured. It returns one redacted result per auth mode with endpoint, provider ID, inbound message type, status code, `canonicalCode`, message, response body, and diagnosis. If OAuth gets a `401` auth-class error while Private Integration reaches `400` payload validation or succeeds, the response recommends `private_integration` for investigation. Production LINE forwarding is not changed by this diagnostic.
+Uses the same safe fake inbound-message payload and compares HighLevel responses for stored Marketplace OAuth and Private Integration auth when `GHL_PRIVATE_INTEGRATION_TOKEN` is configured. It returns one redacted result per auth mode with endpoint, provider ID, inbound message type, status code, `canonicalCode`, message, response body, and diagnosis. Production LINE forwarding is forced to OAuth and is not changed by this diagnostic.
 
 ### `GET /debug/ghl-inbound-payload-matrix`
 

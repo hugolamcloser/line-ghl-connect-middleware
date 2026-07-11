@@ -236,9 +236,8 @@ function getRecommendation(results: MatrixResult[]): {
 
   if (oauthResult && privateResult?.attempted && isAuthClassFailure(oauthResult) && isPayloadValidationOrSuccess(privateResult)) {
     return {
-      recommended_send_auth_mode: "private_integration",
       recommended_action:
-        "Private Integration auth reached HighLevel request validation while Marketplace OAuth was rejected by authClass. Production sending has not been changed."
+        "Private Integration auth reached HighLevel request validation while Marketplace OAuth was rejected by authClass. Production sending remains OAuth-only; use this result to investigate the Marketplace app install, provider binding, or OAuth authClass with HighLevel support."
     };
   }
 

@@ -12,6 +12,7 @@ type GhlResolvedAuthMode = GhlAuthContext["mode"];
 
 type ContactRequestDiagnostics = {
   contact_auth_mode_used: GhlResolvedAuthMode;
+  configured_inbound_send_auth_mode: GhlLocationApiAuthMode;
   inbound_send_auth_mode_used: GhlLocationApiAuthMode;
   used_private_integration_token_for_contact: boolean;
   used_private_integration_token_for_inbound_send: boolean;
@@ -203,8 +204,12 @@ export function getConfiguredLocationApiAuthMode(): GhlLocationApiAuthMode {
   return env.GHL_LOCATION_API_AUTH_MODE;
 }
 
-export function getEffectiveInboundSendAuthMode(): GhlLocationApiAuthMode {
+export function getConfiguredInboundSendAuthMode(): GhlLocationApiAuthMode {
   return env.GHL_INBOUND_SEND_AUTH_MODE;
+}
+
+export function getEffectiveInboundSendAuthMode(): GhlLocationApiAuthMode {
+  return "oauth";
 }
 
 export function getLocationApiPrivateTokenPresent(): boolean {
@@ -213,6 +218,7 @@ export function getLocationApiPrivateTokenPresent(): boolean {
 
 export function getLineInboundFlowAuthDiagnostics(contactStep: GhlLineInboundContactStep): {
   contact_auth_mode_used: GhlLocationApiAuthMode;
+  configured_inbound_send_auth_mode: GhlLocationApiAuthMode;
   inbound_send_auth_mode_used: GhlLocationApiAuthMode;
   used_private_integration_token_for_contact: boolean;
   used_private_integration_token_for_inbound_send: boolean;
@@ -223,6 +229,7 @@ export function getLineInboundFlowAuthDiagnostics(contactStep: GhlLineInboundCon
 
   return {
     contact_auth_mode_used: contactAuthMode,
+    configured_inbound_send_auth_mode: getConfiguredInboundSendAuthMode(),
     inbound_send_auth_mode_used: inboundSendAuthMode,
     used_private_integration_token_for_contact: contactAuthMode === "private_integration",
     used_private_integration_token_for_inbound_send: inboundSendAuthMode === "private_integration",
@@ -275,6 +282,7 @@ function buildContactDiagnostics(input: {
 
   return {
     contact_auth_mode_used: input.authMode,
+    configured_inbound_send_auth_mode: getConfiguredInboundSendAuthMode(),
     inbound_send_auth_mode_used: inboundSendAuthMode,
     used_private_integration_token_for_contact: input.authMode === "private_integration",
     used_private_integration_token_for_inbound_send: inboundSendAuthMode === "private_integration",
