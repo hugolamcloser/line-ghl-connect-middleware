@@ -9,18 +9,32 @@ import { errorHandler, notFoundHandler } from "./middleware/errors";
 import { adminRouter } from "./routes/admin";
 import { appLineRouter } from "./routes/appLine";
 import { debugRouter } from "./routes/debug";
+import { ghlAppInstallWebhookRouter } from "./routes/ghlAppInstallWebhook";
 import { ghlWebhookRouter } from "./routes/ghlWebhook";
 import { healthRouter } from "./routes/health";
 import { lineWebhookRouter } from "./routes/lineWebhook";
 import { oauthRouter } from "./routes/oauth";
 
 const sensitiveQueryKeyNames = [
+  "authorization",
+  "code",
   "pageToken",
   "actionToken",
+  "access_token",
+  "accessToken",
+  "refresh_token",
+  "refreshToken",
   "channelAccessToken",
   "channelSecret",
   "channel_access_token",
-  "channel_secret"
+  "channel_secret",
+  "x-ghl-signature",
+  "x-wh-signature",
+  "x-line-signature",
+  "x-provider-secret",
+  "x-ghl-secret",
+  "x-webhook-secret",
+  "x-wincrm-webhook-secret"
 ] as const;
 
 const sensitiveQueryKeys = new Set(sensitiveQueryKeyNames.map((key) => key.toLowerCase()));
@@ -29,7 +43,7 @@ function isSensitiveQueryKey(key: string): boolean {
   return sensitiveQueryKeys.has(key.toLowerCase());
 }
 
-function redactSensitiveUrlQuery(rawUrl: string | undefined): string | undefined {
+export function redactSensitiveUrlQuery(rawUrl: string | undefined): string | undefined {
   if (!rawUrl) {
     return rawUrl;
   }
@@ -48,7 +62,7 @@ function redactSensitiveUrlQuery(rawUrl: string | undefined): string | undefined
     return changed ? `${parsedUrl.pathname}${parsedUrl.search}` : rawUrl;
   } catch {
     return rawUrl.replace(
-      /([?&](?:pageToken|actionToken|channelAccessToken|channelSecret|channel_access_token|channel_secret)=)[^&]*/gi,
+      /([?&](?:code|pageToken|actionToken|access_token|accessToken|refresh_token|refreshToken|channelAccessToken|channelSecret|channel_access_token|channel_secret)=)[^&]*/gi,
       "$1[redacted]"
     );
   }
@@ -82,7 +96,7 @@ function redactUrlHeaderValue(value: unknown): unknown {
   return value;
 }
 
-function redactRequestHeaders(headers: unknown): unknown {
+export function redactRequestHeaders(headers: unknown): unknown {
   if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
     return headers;
   }
@@ -152,6 +166,7 @@ export function createApp() {
   app.use(healthRouter);
   app.use(debugRouter);
   app.use(oauthRouter);
+  app.use(ghlAppInstallWebhookRouter);
   app.use(lineWebhookRouter);
   app.use(ghlWebhookRouter);
   app.use(appLineRouter);

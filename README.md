@@ -60,7 +60,7 @@ Important production values:
 - `GHL_LOCATION_API_AUTH_MODE`: Auth mode for LINE inbound location-level writes: contact create, contact fetch/update, tags, and optional custom fields. The confirmed production setup uses `private_integration`.
 - `GHL_INBOUND_SEND_AUTH_MODE`: Legacy diagnostic/config visibility for `POST /conversations/messages/inbound`. The real inbound send path is forced to the stored location OAuth token.
 - `GHL_OAUTH_CLIENT_ID`, `GHL_OAUTH_CLIENT_SECRET`, and `GHL_OAUTH_REDIRECT_URI`: HighLevel Marketplace app OAuth settings. Production LINE to GHL forwarding uses the installed location OAuth token stored in Supabase.
-- `GHL_MARKETPLACE_APP_ID`: HighLevel Marketplace App ID. Required when HighLevel returns a Company token and the middleware must look up installed locations before creating location-scoped tokens.
+- `GHL_MARKETPLACE_APP_ID`: HighLevel Marketplace App ID. Required to correlate signed AppInstall events with short-lived Company OAuth sessions before creating exact location-scoped tokens.
 - `GHL_LINE_USER_ID_FIELD_ID`: Optional GHL custom field ID for storing the LINE user ID.
 - `GHL_LINE_DISPLAY_NAME_FIELD_ID`: Optional GHL custom field ID for storing the LINE display name.
 - `GHL_PRIVATE_INTEGRATION_TOKEN`: Required for this production setup because `GHL_LOCATION_API_AUTH_MODE=private_integration`.
@@ -74,7 +74,7 @@ Use these values for the confirmed production LINE to GHL setup:
 ```text
 NODE_ENV=production
 LOG_LEVEL=info
-PUBLIC_BASE_URL=https://win-line-connect-production.up.railway.app
+PUBLIC_BASE_URL=https://win-crm.up.railway.app
 SUPABASE_URL=...
 SUPABASE_SERVICE_ROLE_KEY=...
 LINE_CHANNEL_SECRET=...
@@ -85,7 +85,7 @@ GHL_LOCATION_ID=...
 GHL_CUSTOM_PROVIDER_ID=...
 GHL_OAUTH_CLIENT_ID=...
 GHL_OAUTH_CLIENT_SECRET=...
-GHL_OAUTH_REDIRECT_URI=https://win-line-connect-production.up.railway.app/oauth/callback
+GHL_OAUTH_REDIRECT_URI=https://win-crm.up.railway.app/oauth/callback
 GHL_OAUTH_TOKEN_URL=https://services.leadconnectorhq.com/oauth/token
 GHL_MARKETPLACE_APP_ID=...
 GHL_INBOUND_MESSAGE_TYPE=Custom
@@ -103,7 +103,7 @@ Optional variables:
 - `GHL_LINE_USER_ID_FIELD_ID`: Optional GHL custom field for the LINE user ID.
 - `GHL_LINE_DISPLAY_NAME_FIELD_ID`: Optional GHL custom field for the LINE display name.
 
-OAuth onboarding is multi-tenant and zero-touch after the global Railway configuration is set. Direct Location OAuth responses are stored against the returned `locationId`. Company OAuth responses are converted into one location-scoped token per approved or installed location using `GHL_MARKETPLACE_APP_ID`, `/oauth/installed-locations`, and `/oauth/location-token`. The middleware ensures the tenant for each returned location and upserts that location's `ghl_oauth_tokens` row. It never uses `GHL_LOCATION_ID` to guess a new installation.
+OAuth onboarding is multi-tenant and zero-touch after the global Railway configuration is set. Direct Location OAuth responses are stored against the returned `locationId`. Company OAuth responses are held as short-lived server-only onboarding sessions and correlated with the exact location from HighLevel's signed AppInstall webhook. The middleware then calls `/oauth/location-token`, ensures that location's tenant, and upserts only that location's `ghl_oauth_tokens` row. It never uses `GHL_LOCATION_ID`, historical installed-location lists, or another tenant's token to guess a new installation.
 
 Deprecated, testing-only, or migration-only variables:
 
@@ -123,15 +123,16 @@ These settings are part of the confirmed working production wiring. Keep them un
 - `GHL_SEND_CONVERSATION_PROVIDER_ID=true`: The working inbound message payload includes `conversationProviderId`.
 - `GHL_INBOUND_SEND_AUTH_MODE=oauth`: The working inbound message send uses the installed Location OAuth token. The runtime enforces OAuth for this endpoint.
 - `GHL_LOCATION_API_AUTH_MODE=private_integration`: The working contact create/update/tag/custom-field path uses the Private Integration token.
-- LINE webhook URL: `https://win-line-connect-production.up.railway.app/webhooks/line/inbound`
-- GHL Conversation Provider Delivery URL: `https://win-line-connect-production.up.railway.app/webhooks/ghl/line/outbound`
+- LINE webhook URL: `https://win-crm.up.railway.app/webhooks/line/inbound`
+- GHL Conversation Provider Delivery URL: `https://win-crm.up.railway.app/webhooks/ghl/line/outbound`
+- GHL AppInstall webhook Delivery URL: `https://win-crm.up.railway.app/webhooks/ghl/app-install`
 
 ## Future Custom Domain Migration
 
 `api.win-crm.ai` is not active for the current production setup yet. The current working production base URL is:
 
 ```text
-https://win-line-connect-production.up.railway.app
+https://win-crm.up.railway.app
 ```
 
 Only switch to `api.win-crm.ai` after the custom domain is connected in Railway and tested end to end. When switching, update these values and external settings together:
@@ -159,6 +160,8 @@ Apply migrations in order:
 1. `supabase/migrations/202607020001_initial_schema.sql`
 2. `supabase/migrations/202607030001_ghl_oauth_tokens.sql`
 3. `supabase/migrations/202607060001_line_profiles_unique_line_user.sql`
+4. `supabase/migrations/202607080001_line_channels.sql`
+5. `supabase/migrations/202607110001_ghl_oauth_onboarding.sql`
 
 Using the Supabase CLI:
 
@@ -170,7 +173,7 @@ Or paste each SQL migration into the Supabase SQL editor and run them one at a t
 
 Seeing `Success. No rows returned` after running the migration is normal because the SQL creates schema objects and does not return table rows. RLS can be enabled on the tables; this backend uses `SUPABASE_SERVICE_ROLE_KEY`, which bypasses RLS for server-side operations. Do not expose `SUPABASE_SERVICE_ROLE_KEY` publicly, in browser code, or in mobile apps.
 
-The OAuth migration creates `ghl_oauth_tokens` for server-side Marketplace install tokens and adds GHL debug columns to `message_events`. Never expose `access_token` or `refresh_token` values from Supabase.
+The OAuth migrations create `ghl_oauth_tokens` for location-scoped Marketplace tokens plus `ghl_oauth_onboarding_sessions` and `ghl_pending_app_installs` for durable AppInstall correlation. Company credentials are server-only, capped to a short onboarding lifetime, and never stored as location tokens. Never expose token values from Supabase.
 
 ## Install And Build
 
@@ -193,28 +196,29 @@ npm start
 
 ## Webhook URLs
 
-Assuming `PUBLIC_BASE_URL=https://win-line-connect-production.up.railway.app`:
+Assuming `PUBLIC_BASE_URL=https://win-crm.up.railway.app`:
 
-- LINE webhook URL: `https://win-line-connect-production.up.railway.app/webhooks/line/inbound`
-- HighLevel outbound provider webhook URL: `https://win-line-connect-production.up.railway.app/webhooks/ghl/line/outbound`
-- HighLevel Marketplace OAuth callback URL: `https://win-line-connect-production.up.railway.app/oauth/callback`
-- Health check: `https://win-line-connect-production.up.railway.app/health`
-- Safe environment check: `https://win-line-connect-production.up.railway.app/debug/env-check`
-- OAuth token status: `https://win-line-connect-production.up.railway.app/debug/oauth-status`
-- OAuth callback config: `https://win-line-connect-production.up.railway.app/debug/oauth-callback-config`
-- OAuth token test: `https://win-line-connect-production.up.railway.app/debug/ghl-token-test`
-- Provider config check: `https://win-line-connect-production.up.railway.app/debug/provider-config`
-- Provider access test: `https://win-line-connect-production.up.railway.app/debug/ghl-provider-test`
-- Inbound message endpoint test: `https://win-line-connect-production.up.railway.app/debug/ghl-inbound-message-endpoint-test`
-- Inbound send auth config: `https://win-line-connect-production.up.railway.app/debug/inbound-send-auth-config`
-- Configured inbound send auth test: `https://win-line-connect-production.up.railway.app/debug/ghl-inbound-send-auth-test`
-- Contact auth test: `https://win-line-connect-production.up.railway.app/debug/ghl-contact-auth-test`
-- Inbound auth matrix test: `https://win-line-connect-production.up.railway.app/debug/ghl-inbound-message-auth-matrix-test`
+- LINE webhook URL: `https://win-crm.up.railway.app/webhooks/line/inbound`
+- HighLevel outbound provider webhook URL: `https://win-crm.up.railway.app/webhooks/ghl/line/outbound`
+- HighLevel Marketplace OAuth callback URL: `https://win-crm.up.railway.app/oauth/callback`
+- HighLevel AppInstall webhook Delivery URL: `https://win-crm.up.railway.app/webhooks/ghl/app-install`
+- Health check: `https://win-crm.up.railway.app/health`
+- Safe environment check: `https://win-crm.up.railway.app/debug/env-check`
+- OAuth token status: `https://win-crm.up.railway.app/debug/oauth-status`
+- OAuth callback config: `https://win-crm.up.railway.app/debug/oauth-callback-config`
+- OAuth token test: `https://win-crm.up.railway.app/debug/ghl-token-test`
+- Provider config check: `https://win-crm.up.railway.app/debug/provider-config`
+- Provider access test: `https://win-crm.up.railway.app/debug/ghl-provider-test`
+- Inbound message endpoint test: `https://win-crm.up.railway.app/debug/ghl-inbound-message-endpoint-test`
+- Inbound send auth config: `https://win-crm.up.railway.app/debug/inbound-send-auth-config`
+- Configured inbound send auth test: `https://win-crm.up.railway.app/debug/ghl-inbound-send-auth-test`
+- Contact auth test: `https://win-crm.up.railway.app/debug/ghl-contact-auth-test`
+- Inbound auth matrix test: `https://win-crm.up.railway.app/debug/ghl-inbound-message-auth-matrix-test`
 
 Protected support-only diagnostics:
 
-- Inbound payload matrix test: `https://win-line-connect-production.up.railway.app/debug/ghl-inbound-payload-matrix`
-- Token install summary: `https://win-line-connect-production.up.railway.app/debug/ghl-token-install-summary`
+- Inbound payload matrix test: `https://win-crm.up.railway.app/debug/ghl-inbound-payload-matrix`
+- Token install summary: `https://win-crm.up.railway.app/debug/ghl-token-install-summary`
 
 In production, these protected diagnostics require `WEBHOOK_SHARED_SECRET` in `x-webhook-secret` or `Authorization: Bearer ...`. The payload matrix can create diagnostic messages in GHL if a payload variant succeeds, so use these only during support or migration work.
 
@@ -241,17 +245,18 @@ LINE signatures are verified against the exact raw UTF-8 body, so do not put mid
 ## HighLevel Configuration
 
 1. Create or open the HighLevel Marketplace app for this middleware.
-2. Set the Marketplace app OAuth callback URL to `https://win-line-connect-production.up.railway.app/oauth/callback`.
+2. Set the Marketplace app OAuth callback URL to `https://win-crm.up.railway.app/oauth/callback`.
 3. Add the Marketplace app client ID and client secret to Railway as `GHL_OAUTH_CLIENT_ID` and `GHL_OAUTH_CLIENT_SECRET`.
 4. Add the Marketplace App ID to Railway as `GHL_MARKETPLACE_APP_ID`. This is not the OAuth client ID.
 5. Configure a custom Conversation Provider for the app/location.
 6. Put the actual custom Conversation Provider ID into `GHL_CUSTOM_PROVIDER_ID`. This is not the Marketplace OAuth client ID.
 7. For the confirmed production LINE provider, set `GHL_INBOUND_MESSAGE_TYPE=Custom` and `GHL_SEND_CONVERSATION_PROVIDER_ID=true`.
-8. Set the provider Delivery URL to `https://win-line-connect-production.up.railway.app/webhooks/ghl/line/outbound`.
+8. Set the provider Delivery URL to `https://win-crm.up.railway.app/webhooks/ghl/line/outbound`.
 9. If the provider supports a custom header or secret field, set it to `GHL_CUSTOM_PROVIDER_SECRET`.
-10. Install the Marketplace app into any target GHL location. HighLevel redirects to `/oauth/callback?code=...`, and the middleware automatically resolves the real location, ensures its tenant row, and stores its location-scoped OAuth token.
-11. Open `/debug/provider-config`; if `provider_id_equals_oauth_client_id` is `true`, `GHL_CUSTOM_PROVIDER_ID` is almost certainly wrong.
-12. For normal production checks, use the smoke test below. Keep the deeper GHL provider/debug endpoints for support or migration work only.
+10. Subscribe the Marketplace app's `AppInstall` event to `https://win-crm.up.railway.app/webhooks/ghl/app-install`.
+11. Install the Marketplace app into any target GHL location. The OAuth callback and signed AppInstall event can arrive in either order; the middleware correlates them by app/company and creates a token only for the exact event `locationId`.
+12. Open `/debug/provider-config`; if `provider_id_equals_oauth_client_id` is `true`, `GHL_CUSTOM_PROVIDER_ID` is almost certainly wrong.
+13. For normal production checks, use the smoke test below. Keep the deeper GHL provider/debug endpoints for support or migration work only.
 
 The inbound message client posts to:
 
@@ -269,7 +274,7 @@ If HighLevel returns `This authClass type is not allowed to access this scope`, 
 
 If support asks for deeper diagnostics, `/debug/ghl-inbound-message-auth-matrix-test` can compare OAuth and Private Integration behavior without changing production behavior. Real inbound forwarding remains forced to OAuth for this endpoint.
 
-The Conversation Provider Delivery URL is only for GHL to middleware outbound messages. LINE inbound messages come from the LINE webhook and are then written into GHL through the LeadConnector API using `GHL_LOCATION_API_AUTH_MODE` for contact writes and the stored location OAuth token for `POST /conversations/messages/inbound`. Marketplace webhooks are separate from the Conversation Provider Delivery URL and are not required for this app unless you add separate GHL event-notification features.
+The Conversation Provider Delivery URL is only for GHL to middleware outbound messages. LINE inbound messages come from the LINE webhook and are then written into GHL through the LeadConnector API using `GHL_LOCATION_API_AUTH_MODE` for contact writes and the stored location OAuth token for `POST /conversations/messages/inbound`. The separate signed AppInstall webhook is required for exact Company OAuth onboarding correlation.
 
 ## Mapping A LINE User To A GHL Contact
 
@@ -285,7 +290,7 @@ For example: `line:U93ebe957edac218bfa9b204bc8060446`. The contact source stays 
 The admin endpoint remains available as an override tool. Use it when you want to attach a LINE user to an existing GHL contact or conversation:
 
 ```bash
-curl -X POST https://win-line-connect-production.up.railway.app/admin/mappings \
+curl -X POST https://win-crm.up.railway.app/admin/mappings \
   -H "Content-Type: application/json" \
   -H "x-webhook-secret: $WEBHOOK_SHARED_SECRET" \
   -d '{
@@ -361,7 +366,11 @@ Protected in production by `WEBHOOK_SHARED_SECRET`. Returns a safe summary of th
 
 ### `GET /oauth/callback`
 
-HighLevel Marketplace OAuth callback. It accepts the `code` returned after app installation, exchanges it for tokens, stores only location-scoped OAuth tokens in Supabase, and returns safe install status without exposing token values. If HighLevel returns a Company token, the middleware resolves approved or installed locations and exchanges the Company token for one location token per location before storage.
+HighLevel Marketplace OAuth callback. It accepts the `code` returned after app installation and never exposes token values. Direct Location responses are stored immediately. Company responses create a short-lived server-only onboarding session and return `pending_app_install`, `completed_locations`, or `failed`; they do not fan out across historical installed locations.
+
+### `POST /webhooks/ghl/app-install`
+
+Receives HighLevel `INSTALL` events at `https://win-crm.up.railway.app/webhooks/ghl/app-install`. It verifies `X-GHL-Signature` against the exact raw body, validates `appId`, `companyId`, and `locationId`, ensures the exact tenant, and durably reconciles that location with a matching Company OAuth session. Duplicate deliveries and reinstalls are idempotent. No shared-secret query parameter is used.
 
 ### `POST /webhooks/line`
 
@@ -400,14 +409,15 @@ This is the shortest path for deploying Hugo's current Railway production middle
 1. Run all Supabase migrations.
 2. Deploy this repository to Railway from the `main` branch.
 3. Add all Railway environment variables from `.env.example` using real values in Railway only.
-4. Use the current Railway production URL: `https://win-line-connect-production.up.railway.app`.
-5. Set the GHL Marketplace OAuth callback URL to `https://win-line-connect-production.up.railway.app/oauth/callback`.
-6. Install the GHL Marketplace app into the target location.
-7. Test `GET /health`, `GET /debug/env-check`, and `GET /debug/oauth-status`.
-8. Confirm `/debug/provider-config` shows the expected provider ID and production auth settings.
-9. Set the LINE Developers webhook URL to `https://win-line-connect-production.up.railway.app/webhooks/line/inbound`.
-10. Set the GHL Conversation Provider Delivery URL to `https://win-line-connect-production.up.railway.app/webhooks/ghl/line/outbound`.
-11. Run the Production Smoke Test Checklist.
+4. Use the current Railway production URL: `https://win-crm.up.railway.app`.
+5. Set the GHL Marketplace OAuth callback URL to `https://win-crm.up.railway.app/oauth/callback`.
+6. Subscribe `AppInstall` to `https://win-crm.up.railway.app/webhooks/ghl/app-install`.
+7. Install the GHL Marketplace app into the target location.
+8. Test `GET /health`, `GET /debug/env-check`, and `GET /debug/oauth-status`.
+9. Confirm `/debug/provider-config` shows the expected provider ID and production auth settings.
+10. Set the LINE Developers webhook URL to `https://win-crm.up.railway.app/webhooks/line/inbound`.
+11. Set the GHL Conversation Provider Delivery URL to `https://win-crm.up.railway.app/webhooks/ghl/line/outbound`.
+12. Run the Production Smoke Test Checklist.
 
 ### Smoke Test
 
@@ -420,15 +430,15 @@ After deploy, run the top-level Production Smoke Test Checklist in this README.
 3. Choose **Deploy from GitHub repo**.
 4. Select `hugolamcloser/line-ghl-connect-middleware`.
 5. Let Railway detect the Node.js app. The project builds with `npm install` and starts with `npm start`.
-6. Use the current production Railway domain: `https://win-line-connect-production.up.railway.app`.
+6. Use the current production Railway domain: `https://win-crm.up.railway.app`.
 7. Leave custom domain setup for the Future Custom Domain Migration section.
 
 After deployment, test:
 
 ```text
-GET https://win-line-connect-production.up.railway.app/health
-GET https://win-line-connect-production.up.railway.app/debug/env-check
-GET https://win-line-connect-production.up.railway.app/debug/oauth-status
+GET https://win-crm.up.railway.app/health
+GET https://win-crm.up.railway.app/debug/env-check
+GET https://win-crm.up.railway.app/debug/oauth-status
 ```
 
 ### 2. Create The Supabase Project
@@ -451,9 +461,9 @@ The service role key is powerful. Put it only in Railway environment variables, 
 6. Paste the full SQL into Supabase and click **Run**.
 7. Open `supabase/migrations/202607060001_line_profiles_unique_line_user.sql`.
 8. Paste the full SQL into Supabase and click **Run**.
-9. `Success. No rows returned` is the expected result for these migrations.
-10. If you clicked **Run and enable RLS**, that is okay for this backend because it uses `SUPABASE_SERVICE_ROLE_KEY`.
-11. Confirm these tables exist: `tenants`, `line_profiles`, `message_events`, `webhook_events`, and `ghl_oauth_tokens`.
+9. Apply `supabase/migrations/202607080001_line_channels.sql` and `supabase/migrations/202607110001_ghl_oauth_onboarding.sql` in the same way.
+10. `Success. No rows returned` is the expected result for these migrations.
+11. Confirm `ghl_oauth_onboarding_sessions` and `ghl_pending_app_installs` exist in addition to the existing tenant, LINE, webhook, and OAuth tables.
 12. Keep `SUPABASE_SERVICE_ROLE_KEY` only in Railway service variables. Never paste it into public docs, frontend code, or client apps.
 
 ### 4. Add Railway Environment Variables
@@ -464,7 +474,7 @@ Add these variables in Railway under your service's **Variables** tab:
 NODE_ENV=production
 PORT=3000
 LOG_LEVEL=info
-PUBLIC_BASE_URL=https://win-line-connect-production.up.railway.app
+PUBLIC_BASE_URL=https://win-crm.up.railway.app
 SUPABASE_URL=...
 SUPABASE_SERVICE_ROLE_KEY=...
 LINE_CHANNEL_SECRET=...
@@ -475,7 +485,7 @@ GHL_LOCATION_ID=...
 GHL_CUSTOM_PROVIDER_ID=...
 GHL_OAUTH_CLIENT_ID=...
 GHL_OAUTH_CLIENT_SECRET=...
-GHL_OAUTH_REDIRECT_URI=https://win-line-connect-production.up.railway.app/oauth/callback
+GHL_OAUTH_REDIRECT_URI=https://win-crm.up.railway.app/oauth/callback
 GHL_OAUTH_TOKEN_URL=https://services.leadconnectorhq.com/oauth/token
 GHL_MARKETPLACE_APP_ID=...
 GHL_INBOUND_MESSAGE_TYPE=Custom
@@ -494,7 +504,7 @@ WEBHOOK_SHARED_SECRET=...
 Then open:
 
 ```text
-https://win-line-connect-production.up.railway.app/debug/env-check
+https://win-crm.up.railway.app/debug/env-check
 ```
 
 Every required variable should show `present`. Optional variables may be `missing`. This endpoint never shows the actual secret values.
@@ -511,16 +521,17 @@ Use the legacy/default `LINE_CHANNEL_SECRET`, `LINE_CHANNEL_ACCESS_TOKEN`, and `
 2. Set the app OAuth callback URL to:
 
 ```text
-https://win-line-connect-production.up.railway.app/oauth/callback
+https://win-crm.up.railway.app/oauth/callback
 ```
 
 3. Copy the Marketplace app client ID into `GHL_OAUTH_CLIENT_ID`.
 4. Copy the Marketplace app client secret into `GHL_OAUTH_CLIENT_SECRET`.
 5. Copy the Marketplace App ID into `GHL_MARKETPLACE_APP_ID`. Do not use `GHL_OAUTH_CLIENT_ID` as the app ID.
-6. Put `https://win-line-connect-production.up.railway.app/oauth/callback` into `GHL_OAUTH_REDIRECT_URI`.
-7. Install the Marketplace app into any target location. HighLevel should redirect to `/oauth/callback?code=...`, and the middleware will store location-scoped access and refresh tokens in Supabase without manually entering that location ID.
-8. Connect that customer's LINE Official Account through the LINE custom page.
-9. Use the production smoke test below to confirm the full LINE to GHL and GHL to LINE flow.
+6. Put `https://win-crm.up.railway.app/oauth/callback` into `GHL_OAUTH_REDIRECT_URI`.
+7. Subscribe `AppInstall` to `https://win-crm.up.railway.app/webhooks/ghl/app-install`.
+8. Install the Marketplace app into any target location. The callback and AppInstall event may arrive in either order; the middleware will create the exact location token without manually entering a location ID.
+9. Connect that customer's LINE Official Account through the LINE custom page.
+10. Use the production smoke test below to confirm the full LINE to GHL and GHL to LINE flow.
 11. Use deeper debug endpoints only during support or migration work.
 
 ### 7. Configure The GHL Conversation Provider
@@ -534,7 +545,7 @@ https://win-line-connect-production.up.railway.app/oauth/callback
 7. Set the custom provider Delivery URL to:
 
 ```text
-https://win-line-connect-production.up.railway.app/webhooks/ghl/line/outbound
+https://win-crm.up.railway.app/webhooks/ghl/line/outbound
 ```
 
 This Delivery URL is for GHL replies going back to LINE. It is not the OAuth callback URL and it is not the LINE webhook URL.
@@ -551,7 +562,7 @@ This Delivery URL is for GHL replies going back to LINE. It is not the OAuth cal
 
 1. Open the GHL conversation that was created or mapped from LINE.
 2. Send a reply from GHL.
-3. GHL should POST to `https://win-line-connect-production.up.railway.app/webhooks/ghl/line/outbound`.
+3. GHL should POST to `https://win-crm.up.railway.app/webhooks/ghl/line/outbound`.
 4. The middleware should find the Supabase mapping and push the reply to the LINE user.
 5. Check `message_events` in Supabase if the message does not arrive.
 
@@ -566,7 +577,7 @@ This Delivery URL is for GHL replies going back to LINE. It is not the OAuth cal
 - `This authClass type is not allowed to access this scope`: OAuth token storage is working, but HighLevel is rejecting the app/provider authorization for the inbound-message API. Keep the confirmed production auth values unchanged unless you are migrating. If support needs deeper diagnostics, open `/debug/ghl-token-install-summary` and `/debug/ghl-inbound-payload-matrix` with `WEBHOOK_SHARED_SECRET` in production.
 - Support-only inbound diagnostics disagree with production smoke tests: trust the real smoke test first. Use matrix/provider/debug endpoints only to investigate a new HighLevel app, provider, or location migration.
 - `HighLevel create contact response did not include a contact id`: The GHL create-contact response shape changed or the token cannot create contacts. Check the Railway logs and the HighLevel API response.
-- `GHL_MARKETPLACE_APP_ID is required`: Add the Marketplace App ID to Railway so Company OAuth installs can be resolved into location-scoped tokens.
+- `GHL_MARKETPLACE_APP_ID is required`: Add the Marketplace App ID to Railway and confirm the signed AppInstall event is delivered to `/webhooks/ghl/app-install`.
 - `GHL_LOCATION_ID is required`: This only affects legacy/default diagnostics. It must not be used to identify a new OAuth installation.
 - `GHL_CUSTOM_PROVIDER_ID is required`: Add the Conversation Provider ID to Railway and redeploy.
 - GHL replies do not reach LINE: Confirm the GHL provider delivery URL is `/webhooks/ghl/line/outbound`, confirm `GHL_CUSTOM_PROVIDER_SECRET` matches if you use one, and confirm the GHL contact or conversation exists in `line_profiles`.

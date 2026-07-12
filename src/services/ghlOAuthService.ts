@@ -2,15 +2,26 @@ import { env, requireEnvValue } from "../config/env";
 import { logger } from "../config/logger";
 import { redactSensitiveText } from "../utils/redaction";
 import {
+  claimGhlPendingAppInstall,
+  completeGhlPendingAppInstall,
   ensureTenantForLocation,
+  failGhlPendingAppInstall,
+  getActiveGhlOAuthOnboardingSession,
   getGhlOAuthToken,
   getGhlOAuthTokenStatus,
+  getGhlPendingAppInstall,
+  listReconcileableGhlAppInstalls,
+  markGhlOAuthOnboardingSessionReconciled,
+  upsertGhlOAuthOnboardingSession,
   upsertGhlOAuthToken,
+  upsertPendingGhlAppInstall,
+  type GhlPendingAppInstallRecord,
   type GhlOAuthTokenRecord
 } from "./repository";
 
 const tokenRefreshSkewMs = 5 * 60 * 1000;
 const tokenExchangeTimeoutMs = 15000;
+const companyOnboardingSessionTtlMs = 15 * 60 * 1000;
 const highLevelV3Version = "v3";
 
 export type GhlOAuthErrorCode =
@@ -21,7 +32,9 @@ export type GhlOAuthErrorCode =
   | "oauth_missing_company_id"
   | "oauth_missing_marketplace_app_id"
   | "oauth_missing_installed_locations"
-  | "oauth_location_token_mismatch";
+  | "oauth_location_token_mismatch"
+  | "oauth_app_id_mismatch"
+  | "oauth_onboarding_reconciliation_failed";
 
 type GhlOAuthTokenPayload = {
   access_token?: string;
@@ -58,21 +71,33 @@ type SaveTokenPayloadFallbackMetadata = {
   tokenType?: string | null;
 };
 
+type GhlOAuthSafeLocationStatus = {
+  location_id: string;
+  tenant_id: string;
+  token_present: boolean;
+  refresh_token_present: boolean;
+  expires_at: string | null;
+};
+
 type GhlOAuthCompanyInstallStatus = {
   mode: "company_to_location";
   company_id: string;
-  locations: Array<{
-    location_id: string;
-    tenant_id: string | null;
-    token_present: boolean;
-    refresh_token_present: boolean;
-    expires_at: string | null;
-  }>;
+  status: "completed_locations" | "pending_app_install" | "failed";
+  locations: GhlOAuthSafeLocationStatus[];
 };
 
 export type GhlOAuthInstallStatus =
-  | Awaited<ReturnType<typeof getGhlOAuthTokenStatus>>
+  | (Awaited<ReturnType<typeof getGhlOAuthTokenStatus>> & {
+      mode: "direct_location";
+      status: "direct_location";
+    })
   | GhlOAuthCompanyInstallStatus;
+
+export type GhlOAuthOnboardingReconciliationResult = {
+  status: "completed_locations" | "pending_app_install" | "failed";
+  locations: GhlOAuthSafeLocationStatus[];
+  failed_location_ids: string[];
+};
 
 export type GhlAuthContext = {
   mode: "oauth" | "private_integration";
@@ -269,6 +294,12 @@ function getExpiresAt(payload: GhlOAuthTokenPayload): string {
   return new Date(Date.now() + expiresIn * 1000).toISOString();
 }
 
+function getCompanyOnboardingSessionExpiresAt(payload: GhlOAuthTokenPayload): string {
+  const tokenExpiresAt = new Date(getExpiresAt(payload)).getTime();
+  const shortLivedExpiry = Date.now() + companyOnboardingSessionTtlMs;
+  return new Date(Math.min(tokenExpiresAt, shortLivedExpiry)).toISOString();
+}
+
 function isExpiredOrClose(token: GhlOAuthTokenRecord): boolean {
   return new Date(token.expires_at).getTime() <= Date.now() + tokenRefreshSkewMs;
 }
@@ -399,48 +430,6 @@ function isCompanyTokenPayload(payload: GhlOAuthTokenPayload): boolean {
   return userType === "company" || Boolean(!locationId && accessToken);
 }
 
-function parseJsonRecord(responseText: string, context: string): Record<string, unknown> {
-  try {
-    const parsed = responseText ? (JSON.parse(responseText) as unknown) : {};
-    const record = getRecord(parsed);
-
-    if (!record) {
-      throw new Error(`${context} response was not a JSON object`);
-    }
-
-    return record;
-  } catch (error) {
-    logger.error(
-      {
-        error: error instanceof Error ? error.message : String(error),
-        redactedResponseText: redactSensitiveText(responseText)
-      },
-      `Failed to parse HighLevel ${context} response`
-    );
-    throw new GhlOAuthError({
-      publicErrorCode: "token_response_parse_failed",
-      message: `HighLevel ${context} response was not valid JSON`,
-      responseBody: redactSensitiveText(responseText)
-    });
-  }
-}
-
-function getNextPageToken(payload: Record<string, unknown>): string | undefined {
-  return (
-    getString(payload.nextPageToken) ??
-    getString(payload.next_page_token) ??
-    getString(payload.pageToken) ??
-    getString(payload.page_token) ??
-    getNestedString(payload, "meta", "nextPageToken") ??
-    getNestedString(payload, "meta", "next_page_token")
-  );
-}
-
-function getInstalledLocationIds(payload: Record<string, unknown>): string[] {
-  const items = Array.isArray(payload.items) ? payload.items : [];
-  return uniqueLocationIds(items.map(getLocationIdFromUnknown));
-}
-
 async function requestOAuthToken(entries: Record<string, string>): Promise<GhlOAuthTokenPayload> {
   const body = buildTokenRequestBody(entries);
   const requestDiagnostics = getSafeTokenRequestDiagnostics(Object.fromEntries(body.entries()));
@@ -520,68 +509,6 @@ async function requestOAuthToken(entries: Record<string, string>): Promise<GhlOA
   logger.info({ tokenResponseKeys: getTokenPayloadKeys(payload) }, "Parsed HighLevel OAuth token response");
 
   return payload;
-}
-
-async function fetchInstalledLocationIds(input: { companyAccessToken: string; companyId: string }): Promise<string[]> {
-  const marketplaceAppId = getString(env.GHL_MARKETPLACE_APP_ID);
-
-  if (!marketplaceAppId) {
-    throw new GhlOAuthError({
-      publicErrorCode: "oauth_missing_marketplace_app_id",
-      message: "GHL_MARKETPLACE_APP_ID is required to resolve installed HighLevel locations"
-    });
-  }
-
-  const installedLocationIds: string[] = [];
-  let pageToken: string | undefined;
-
-  do {
-    const url = new URL("/oauth/installed-locations", env.GHL_API_BASE_URL);
-    url.searchParams.set("companyId", input.companyId);
-    url.searchParams.set("appId", marketplaceAppId);
-    url.searchParams.set("isInstalled", "true");
-    url.searchParams.set("pageSize", "100");
-
-    if (pageToken) {
-      url.searchParams.set("pageToken", pageToken);
-    }
-
-    const response = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${input.companyAccessToken}`,
-        Version: highLevelV3Version,
-        Accept: "application/json"
-      }
-    });
-    const responseText = await response.text();
-
-    logger.info(
-      {
-        companyId: input.companyId,
-        marketplaceAppIdPresent: Boolean(marketplaceAppId),
-        pageTokenPresent: Boolean(pageToken),
-        status: response.status,
-        ok: response.ok
-      },
-      "HighLevel installed locations response received"
-    );
-
-    if (!response.ok) {
-      throw new GhlOAuthError({
-        publicErrorCode: "token_exchange_failed",
-        message: `HighLevel installed locations lookup failed with status ${response.status}`,
-        statusCode: response.status,
-        responseBody: redactSensitiveText(responseText)
-      });
-    }
-
-    const responseBody = parseJsonRecord(responseText, "installed locations");
-    installedLocationIds.push(...getInstalledLocationIds(responseBody));
-    pageToken = getNextPageToken(responseBody);
-  } while (pageToken);
-
-  return uniqueLocationIds(installedLocationIds);
 }
 
 async function requestLocationToken(input: {
@@ -726,29 +653,6 @@ async function saveTokenPayload(
   }
 }
 
-async function getTargetLocationIdsForCompanyToken(input: {
-  companyAccessToken: string;
-  companyId: string;
-  approvedLocationIds: string[];
-}): Promise<{ locationIds: string[]; installedLocationCount: number }> {
-  if (input.approvedLocationIds.length > 0) {
-    return {
-      locationIds: input.approvedLocationIds,
-      installedLocationCount: 0
-    };
-  }
-
-  const installedLocationIds = await fetchInstalledLocationIds({
-    companyAccessToken: input.companyAccessToken,
-    companyId: input.companyId
-  });
-
-  return {
-    locationIds: installedLocationIds,
-    installedLocationCount: installedLocationIds.length
-  };
-}
-
 function validateLocationTokenPayload(input: {
   companyId: string;
   targetLocationId: string;
@@ -772,11 +676,210 @@ function validateLocationTokenPayload(input: {
   }
 }
 
-async function exchangeCompanyTokenForLocationTokens(payload: GhlOAuthTokenPayload): Promise<GhlOAuthCompanyInstallStatus> {
+function toSafeLocationStatus(
+  pendingInstall: GhlPendingAppInstallRecord,
+  token: GhlOAuthTokenRecord | null
+): GhlOAuthSafeLocationStatus {
+  const matchingToken = token?.location_id === pendingInstall.location_id && token.tenant_id === pendingInstall.tenant_id
+    ? token
+    : null;
+
+  return {
+    location_id: pendingInstall.location_id,
+    tenant_id: pendingInstall.tenant_id,
+    token_present: Boolean(matchingToken?.access_token),
+    refresh_token_present: Boolean(matchingToken?.refresh_token),
+    expires_at: matchingToken?.expires_at ?? null
+  };
+}
+
+async function getReconciliationCandidates(input: {
+  appId: string;
+  companyId: string;
+  locationIds?: string[];
+}): Promise<GhlPendingAppInstallRecord[]> {
+  if (!input.locationIds) {
+    return listReconcileableGhlAppInstalls(input.appId, input.companyId);
+  }
+
+  const records = await Promise.all(
+    uniqueLocationIds(input.locationIds).map((locationId) =>
+      getGhlPendingAppInstall(input.appId, input.companyId, locationId)
+    )
+  );
+
+  return records.filter((record): record is GhlPendingAppInstallRecord => Boolean(record));
+}
+
+export async function reconcileGhlOAuthOnboarding(input: {
+  appId: string;
+  companyId: string;
+  locationIds?: string[];
+}): Promise<GhlOAuthOnboardingReconciliationResult> {
+  const candidates = await getReconciliationCandidates(input);
+  const locations: GhlOAuthSafeLocationStatus[] = [];
+  const failedLocationIds: string[] = [];
+  const pendingCandidates: GhlPendingAppInstallRecord[] = [];
+
+  for (const candidate of candidates) {
+    if (candidate.status === "completed") {
+      locations.push(toSafeLocationStatus(candidate, await getGhlOAuthToken(candidate.location_id)));
+    } else {
+      pendingCandidates.push(candidate);
+    }
+  }
+
+  if (pendingCandidates.length === 0) {
+    return {
+      status: locations.length > 0 ? "completed_locations" : "pending_app_install",
+      locations,
+      failed_location_ids: []
+    };
+  }
+
+  const session = await getActiveGhlOAuthOnboardingSession(input.appId, input.companyId);
+
+  if (!session?.access_token) {
+    logger.info(
+      {
+        appId: input.appId,
+        companyId: input.companyId,
+        targetLocationIds: pendingCandidates.map((candidate) => candidate.location_id),
+        onboardingSessionPresent: false
+      },
+      "HighLevel AppInstall is pending a matching Company OAuth session"
+    );
+    return {
+      status: "pending_app_install",
+      locations,
+      failed_location_ids: []
+    };
+  }
+
+  for (const pendingInstall of pendingCandidates) {
+    const claimedInstall = await claimGhlPendingAppInstall(pendingInstall.id);
+
+    if (!claimedInstall) {
+      continue;
+    }
+
+    try {
+      const locationTokenPayload = await requestLocationToken({
+        companyAccessToken: session.access_token,
+        companyId: input.companyId,
+        locationId: claimedInstall.location_id
+      });
+
+      validateLocationTokenPayload({
+        companyId: input.companyId,
+        targetLocationId: claimedInstall.location_id,
+        payload: locationTokenPayload
+      });
+
+      const token = await saveTokenPayload(locationTokenPayload);
+
+      if (token.location_id !== claimedInstall.location_id || token.tenant_id !== claimedInstall.tenant_id) {
+        throw new GhlOAuthError({
+          publicErrorCode: "oauth_storage_failed",
+          message: `Stored OAuth token identity did not match pending installation for location ${claimedInstall.location_id}`
+        });
+      }
+
+      await completeGhlPendingAppInstall({ id: claimedInstall.id, sessionId: session.id });
+      locations.push(toSafeLocationStatus(claimedInstall, token));
+
+      logger.info(
+        {
+          appId: input.appId,
+          companyId: input.companyId,
+          locationId: token.location_id,
+          tenantId: token.tenant_id,
+          tokenRowId: token.id,
+          pendingInstallId: claimedInstall.id
+        },
+        "Completed exact HighLevel AppInstall OAuth reconciliation"
+      );
+    } catch (error) {
+      const errorCode = error instanceof GhlOAuthError
+        ? error.publicErrorCode
+        : "oauth_onboarding_reconciliation_failed";
+      await failGhlPendingAppInstall(claimedInstall.id, errorCode);
+      failedLocationIds.push(claimedInstall.location_id);
+      logger.error(
+        {
+          appId: input.appId,
+          companyId: input.companyId,
+          locationId: claimedInstall.location_id,
+          tenantId: claimedInstall.tenant_id,
+          errorCode
+        },
+        "Failed exact HighLevel AppInstall OAuth reconciliation"
+      );
+    }
+  }
+
+  await markGhlOAuthOnboardingSessionReconciled(session.id);
+
+  return {
+    status: failedLocationIds.length > 0
+      ? "failed"
+      : locations.length > 0
+        ? "completed_locations"
+        : "pending_app_install",
+    locations,
+    failed_location_ids: failedLocationIds
+  };
+}
+
+export async function recordGhlAppInstall(input: {
+  appId: string;
+  companyId: string;
+  locationId: string;
+  deliveryKey: string;
+}): Promise<GhlOAuthOnboardingReconciliationResult & { tenant_id: string }> {
+  const configuredAppId = getString(env.GHL_MARKETPLACE_APP_ID);
+
+  if (!configuredAppId || input.appId !== configuredAppId) {
+    throw new GhlOAuthError({
+      publicErrorCode: "oauth_app_id_mismatch",
+      message: "HighLevel AppInstall appId did not match GHL_MARKETPLACE_APP_ID"
+    });
+  }
+
+  const tenant = await ensureTenantForLocation(input.locationId);
+  const pendingInstall = await upsertPendingGhlAppInstall({
+    ...input,
+    tenantId: tenant.id
+  });
+
+  logger.info(
+    {
+      appId: input.appId,
+      companyId: input.companyId,
+      locationId: input.locationId,
+      tenantId: tenant.id,
+      pendingInstallId: pendingInstall.id,
+      pendingInstallStatus: pendingInstall.status
+    },
+    "Persisted idempotent HighLevel AppInstall correlation"
+  );
+
+  const result = await reconcileGhlOAuthOnboarding({
+    appId: input.appId,
+    companyId: input.companyId,
+    locationIds: [input.locationId]
+  });
+
+  return { ...result, tenant_id: tenant.id };
+}
+
+async function saveCompanyOAuthOnboardingSession(payload: GhlOAuthTokenPayload): Promise<GhlOAuthCompanyInstallStatus> {
   const companyAccessToken = getAccessToken(payload);
   const companyId = resolveTokenCompanyId(payload);
   const approvedLocationIds = getApprovedLocationIds(payload);
   const userType = getUserType(payload);
+  const configuredAppId = getString(env.GHL_MARKETPLACE_APP_ID);
+  const responseAppId = getAppId(payload);
 
   logger.info(
     {
@@ -786,7 +889,7 @@ async function exchangeCompanyTokenForLocationTokens(payload: GhlOAuthTokenPaylo
       locationIdPresent: Boolean(resolveTokenLocationId(payload)),
       approvedLocationCount: approvedLocationIds.length,
       isBulkInstallation: getIsBulkInstallation(payload),
-      appIdPresent: Boolean(getAppId(payload)),
+      appIdPresent: Boolean(responseAppId),
       versionIdPresent: Boolean(getVersionId(payload))
     },
     "Detected HighLevel Company OAuth token response"
@@ -806,74 +909,50 @@ async function exchangeCompanyTokenForLocationTokens(payload: GhlOAuthTokenPaylo
     });
   }
 
-  const { locationIds, installedLocationCount } = await getTargetLocationIdsForCompanyToken({
-    companyAccessToken,
-    companyId,
-    approvedLocationIds
-  });
-
-  if (locationIds.length === 0) {
+  if (!configuredAppId) {
     throw new GhlOAuthError({
-      publicErrorCode: "oauth_missing_installed_locations",
-      message: "No approved or installed HighLevel locations were resolved for this Company OAuth installation"
+      publicErrorCode: "oauth_missing_marketplace_app_id",
+      message: "GHL_MARKETPLACE_APP_ID is required for Company OAuth onboarding correlation"
     });
   }
+
+  if (responseAppId && responseAppId !== configuredAppId) {
+    throw new GhlOAuthError({
+      publicErrorCode: "oauth_app_id_mismatch",
+      message: "HighLevel Company OAuth response appId did not match GHL_MARKETPLACE_APP_ID"
+    });
+  }
+
+  const session = await upsertGhlOAuthOnboardingSession({
+    appId: configuredAppId,
+    companyId,
+    accessToken: companyAccessToken,
+    expiresAt: getCompanyOnboardingSessionExpiresAt(payload)
+  });
+  const reconciliation = await reconcileGhlOAuthOnboarding({
+    appId: configuredAppId,
+    companyId
+  });
 
   logger.info(
     {
+      appId: configuredAppId,
       companyId,
+      onboardingSessionId: session.id,
+      onboardingSessionExpiresAt: session.expires_at,
       approvedLocationCount: approvedLocationIds.length,
-      installedLocationCount,
-      targetLocationIds: locationIds
+      completedLocationIds: reconciliation.locations.map((location) => location.location_id),
+      failedLocationIds: reconciliation.failed_location_ids,
+      status: reconciliation.status
     },
-    "Resolved HighLevel Company OAuth target locations"
+    "Stored short-lived Company OAuth session and reconciled exact AppInstall locations"
   );
-
-  const locationTokenPayloads: Array<{ locationId: string; payload: GhlOAuthTokenPayload }> = [];
-
-  for (const locationId of locationIds) {
-    const locationTokenPayload = await requestLocationToken({
-      companyAccessToken,
-      companyId,
-      locationId
-    });
-
-    validateLocationTokenPayload({
-      companyId,
-      targetLocationId: locationId,
-      payload: locationTokenPayload
-    });
-    locationTokenPayloads.push({ locationId, payload: locationTokenPayload });
-  }
-
-  const locations: GhlOAuthCompanyInstallStatus["locations"] = [];
-
-  for (const locationTokenPayload of locationTokenPayloads) {
-    const token = await saveTokenPayload(locationTokenPayload.payload);
-
-    logger.info(
-      {
-        companyId,
-        locationId: token.location_id,
-        tenantId: token.tenant_id,
-        tokenRowId: token.id
-      },
-      "Stored HighLevel location-scoped OAuth token converted from Company token"
-    );
-
-    locations.push({
-      location_id: token.location_id,
-      tenant_id: token.tenant_id,
-      token_present: Boolean(token.access_token),
-      refresh_token_present: Boolean(token.refresh_token),
-      expires_at: token.expires_at
-    });
-  }
 
   return {
     mode: "company_to_location",
     company_id: companyId,
-    locations
+    status: reconciliation.status,
+    locations: reconciliation.locations
   };
 }
 
@@ -902,11 +981,25 @@ export async function exchangeGhlAuthorizationCode(
   });
 
   if (isCompanyTokenPayload(payload)) {
-    return exchangeCompanyTokenForLocationTokens(payload);
+    return saveCompanyOAuthOnboardingSession(payload);
   }
 
   const token = await saveTokenPayload(payload);
-  return getGhlOAuthTokenStatus(token.location_id);
+  const configuredAppId = getString(env.GHL_MARKETPLACE_APP_ID);
+
+  if (configuredAppId && token.company_id) {
+    const pendingInstall = await getGhlPendingAppInstall(configuredAppId, token.company_id, token.location_id);
+
+    if (pendingInstall && pendingInstall.status !== "completed") {
+      await completeGhlPendingAppInstall({ id: pendingInstall.id });
+    }
+  }
+
+  return {
+    ...(await getGhlOAuthTokenStatus(token.location_id)),
+    mode: "direct_location",
+    status: "direct_location"
+  };
 }
 
 export async function refreshGhlOAuthToken(locationId = env.GHL_LOCATION_ID): Promise<GhlOAuthTokenRecord> {

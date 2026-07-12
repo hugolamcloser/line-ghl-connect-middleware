@@ -1,12 +1,13 @@
 const { afterEach, test } = require("node:test");
 const assert = require("node:assert/strict");
+const http = require("node:http");
 
 process.env.NODE_ENV = "test";
 process.env.LOG_LEVEL = "silent";
 process.env.SUPABASE_URL = "https://example.supabase.co";
 process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-role";
-process.env.GHL_LOCATION_ID = "loc_A";
-process.env.GHL_CUSTOM_PROVIDER_ID = "provider_A";
+process.env.GHL_LOCATION_ID = "legacy_global_location";
+process.env.GHL_CUSTOM_PROVIDER_ID = "provider_default";
 process.env.GHL_OAUTH_CLIENT_ID = "oauth-client";
 process.env.GHL_OAUTH_CLIENT_SECRET = "oauth-client-secret";
 process.env.GHL_OAUTH_REDIRECT_URI = "https://example.com/oauth/callback";
@@ -18,22 +19,33 @@ const config = require("../dist/config/env");
 const repository = require("../dist/services/repository");
 const oauthService = require("../dist/services/ghlOAuthService");
 const lineOutbound = require("../dist/services/lineOutboundChannelService");
+const signatureVerifier = require("../dist/middleware/ghlWebhookSignature");
+const { createApp, redactRequestHeaders, redactSensitiveUrlQuery } = require("../dist/app");
 
-const originalRepositoryExports = {};
-
-for (const key of [
+const repositoryMockKeys = [
   "ensureTenantForLocation",
   "getGhlOAuthToken",
   "getGhlOAuthTokenStatus",
   "upsertGhlOAuthToken",
+  "upsertGhlOAuthOnboardingSession",
+  "getActiveGhlOAuthOnboardingSession",
+  "markGhlOAuthOnboardingSessionReconciled",
+  "upsertPendingGhlAppInstall",
+  "getGhlPendingAppInstall",
+  "listReconcileableGhlAppInstalls",
+  "claimGhlPendingAppInstall",
+  "completeGhlPendingAppInstall",
+  "failGhlPendingAppInstall",
   "getLineChannelById",
   "getLineChannelByTenantId"
-]) {
-  originalRepositoryExports[key] = repository[key];
-}
-
+];
+const originalRepositoryExports = Object.fromEntries(
+  repositoryMockKeys.map((key) => [key, repository[key]])
+);
 const originalFetch = global.fetch;
 const originalEnv = { ...config.env };
+const originalRecordGhlAppInstall = oauthService.recordGhlAppInstall;
+const originalVerifyGhlWebhookSignature = signatureVerifier.verifyGhlWebhookSignature;
 
 afterEach(() => {
   for (const [key, value] of Object.entries(originalRepositoryExports)) {
@@ -41,6 +53,8 @@ afterEach(() => {
   }
 
   Object.assign(config.env, originalEnv);
+  oauthService.recordGhlAppInstall = originalRecordGhlAppInstall;
+  signatureVerifier.verifyGhlWebhookSignature = originalVerifyGhlWebhookSignature;
   global.fetch = originalFetch;
 });
 
@@ -48,36 +62,27 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function getTenantIdForLocation(locationId) {
-  if (locationId === "loc_A") {
-    return "tenant_A";
-  }
-
-  if (locationId === "loc_B") {
-    return "tenant_B";
-  }
-
+function tenantIdFor(locationId) {
   return `tenant_${locationId}`;
 }
 
-function buildTenant(locationId, overrides = {}) {
+function buildTenant(locationId) {
   return {
-    id: getTenantIdForLocation(locationId),
+    id: tenantIdFor(locationId),
     location_id: locationId,
     ghl_provider_id: `provider_${locationId}`,
     line_channel_id: "default",
     created_at: "2026-07-11T00:00:00.000Z",
-    updated_at: "2026-07-11T00:00:00.000Z",
-    ...overrides
+    updated_at: "2026-07-11T00:00:00.000Z"
   };
 }
 
 function buildTokenRow(locationId, accessToken, refreshToken, overrides = {}) {
   return {
     id: `token_${locationId}`,
-    tenant_id: null,
+    tenant_id: tenantIdFor(locationId),
     location_id: locationId,
-    company_id: null,
+    company_id: "company_1",
     access_token: accessToken,
     refresh_token: refreshToken,
     expires_at: "2999-01-01T00:00:00.000Z",
@@ -90,131 +95,188 @@ function buildTokenRow(locationId, accessToken, refreshToken, overrides = {}) {
 }
 
 function setupOAuthStore(input = {}) {
-  const rows = new Map(input.initialTokens ?? []);
-  const tenants = new Map(input.initialTenants ?? [["loc_A", buildTenant("loc_A")]]);
-  const failTenantLocations = new Set(input.failTenantLocations ?? []);
+  const tokens = new Map(input.initialTokens ?? []);
+  const tenants = new Map(input.initialTenants ?? []);
+  const sessions = new Map();
+  const pending = new Map();
+  let sessionCounter = 0;
+  let pendingCounter = 0;
+
+  const sessionKey = (appId, companyId) => `${appId}:${companyId}`;
+  const pendingKey = (appId, companyId, locationId) => `${appId}:${companyId}:${locationId}`;
 
   repository.ensureTenantForLocation = async (locationId) => {
-    if (failTenantLocations.has(locationId)) {
-      throw new Error(`No tenant for location ${locationId}`);
-    }
-
     const existing = tenants.get(locationId);
-
-    if (existing) {
-      return existing;
-    }
-
+    if (existing) return existing;
     const tenant = buildTenant(locationId);
     tenants.set(locationId, tenant);
     return tenant;
   };
 
-  repository.getGhlOAuthToken = async (locationId) => rows.get(locationId) ?? null;
+  repository.getGhlOAuthToken = async (locationId) => tokens.get(locationId) ?? null;
   repository.getGhlOAuthTokenStatus = async (locationId) => {
-    const token = rows.get(locationId);
-
-    if (!token) {
-      return {
-        location_id: locationId,
-        token_present: false,
-        refresh_token_present: false,
-        expires_at: null,
-        expired: true,
-        scopes: [],
-        company_id: null
-      };
-    }
-
-    return {
-      location_id: token.location_id,
-      token_present: Boolean(token.access_token),
-      refresh_token_present: Boolean(token.refresh_token),
-      expires_at: token.expires_at,
-      expired: false,
-      scopes: token.scopes,
-      company_id: token.company_id
-    };
+    const token = tokens.get(locationId);
+    return token
+      ? {
+          location_id: token.location_id,
+          token_present: true,
+          refresh_token_present: Boolean(token.refresh_token),
+          expires_at: token.expires_at,
+          expired: false,
+          scopes: token.scopes,
+          company_id: token.company_id
+        }
+      : {
+          location_id: locationId,
+          token_present: false,
+          refresh_token_present: false,
+          expires_at: null,
+          expired: true,
+          scopes: [],
+          company_id: null
+        };
   };
 
   repository.upsertGhlOAuthToken = async (tokenInput) => {
-    const existing = rows.get(tokenInput.locationId);
+    const existing = tokens.get(tokenInput.locationId);
     const token = buildTokenRow(tokenInput.locationId, tokenInput.accessToken, tokenInput.refreshToken, {
       id: existing?.id ?? `token_${tokenInput.locationId}`,
-      tenant_id: tokenInput.tenantId ?? null,
+      tenant_id: tokenInput.tenantId,
       company_id: tokenInput.companyId ?? null,
       expires_at: tokenInput.expiresAt,
       scopes: tokenInput.scopes ?? [],
       token_type: tokenInput.tokenType ?? null,
       created_at: existing?.created_at ?? "2026-07-11T00:00:00.000Z"
     });
-
-    rows.set(tokenInput.locationId, token);
+    tokens.set(tokenInput.locationId, token);
     return token;
   };
 
-  return { rows, tenants };
+  repository.upsertGhlOAuthOnboardingSession = async (sessionInput) => {
+    const key = sessionKey(sessionInput.appId, sessionInput.companyId);
+    const existing = sessions.get(key);
+    const session = {
+      id: existing?.id ?? `session_${++sessionCounter}`,
+      app_id: sessionInput.appId,
+      company_id: sessionInput.companyId,
+      access_token: sessionInput.accessToken,
+      status: "active",
+      expires_at: sessionInput.expiresAt,
+      last_reconciled_at: null,
+      error_code: null,
+      created_at: existing?.created_at ?? new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    sessions.set(key, session);
+    return session;
+  };
+
+  repository.getActiveGhlOAuthOnboardingSession = async (appId, companyId) => {
+    const session = sessions.get(sessionKey(appId, companyId));
+    if (!session || session.status !== "active" || !session.access_token) return null;
+    if (new Date(session.expires_at).getTime() <= Date.now()) {
+      session.status = "expired";
+      session.access_token = null;
+      return null;
+    }
+    return session;
+  };
+
+  repository.markGhlOAuthOnboardingSessionReconciled = async (sessionId) => {
+    const session = [...sessions.values()].find((item) => item.id === sessionId);
+    if (session) session.last_reconciled_at = new Date().toISOString();
+  };
+
+  repository.upsertPendingGhlAppInstall = async (installInput) => {
+    const key = pendingKey(installInput.appId, installInput.companyId, installInput.locationId);
+    const existing = pending.get(key);
+    if (existing?.delivery_key === installInput.deliveryKey) return existing;
+    const record = {
+      id: existing?.id ?? `pending_${++pendingCounter}`,
+      app_id: installInput.appId,
+      company_id: installInput.companyId,
+      location_id: installInput.locationId,
+      tenant_id: installInput.tenantId,
+      delivery_key: installInput.deliveryKey,
+      status: "pending",
+      processing_started_at: null,
+      completed_at: null,
+      completed_session_id: null,
+      error_code: null,
+      created_at: existing?.created_at ?? new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    pending.set(key, record);
+    return record;
+  };
+
+  repository.getGhlPendingAppInstall = async (appId, companyId, locationId) =>
+    pending.get(pendingKey(appId, companyId, locationId)) ?? null;
+  repository.listReconcileableGhlAppInstalls = async (appId, companyId) =>
+    [...pending.values()].filter(
+      (item) => item.app_id === appId && item.company_id === companyId && ["pending", "failed"].includes(item.status)
+    );
+  repository.claimGhlPendingAppInstall = async (id) => {
+    const record = [...pending.values()].find((item) => item.id === id);
+    if (!record || !["pending", "failed"].includes(record.status)) return null;
+    record.status = "processing";
+    record.processing_started_at = new Date().toISOString();
+    return record;
+  };
+  repository.completeGhlPendingAppInstall = async ({ id, sessionId }) => {
+    const record = [...pending.values()].find((item) => item.id === id);
+    assert.ok(record);
+    record.status = "completed";
+    record.processing_started_at = null;
+    record.completed_at = new Date().toISOString();
+    record.completed_session_id = sessionId ?? null;
+    record.error_code = null;
+  };
+  repository.failGhlPendingAppInstall = async (id, errorCode) => {
+    const record = [...pending.values()].find((item) => item.id === id);
+    assert.ok(record);
+    record.status = "failed";
+    record.processing_started_at = null;
+    record.error_code = errorCode;
+  };
+
+  return { tokens, tenants, sessions, pending, sessionKey, pendingKey };
 }
 
 function jsonResponse(payload, status = 200) {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: {
-      "content-type": "application/json"
-    }
-  });
+  return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } });
 }
 
 function createFetchSequence(steps) {
   const calls = [];
-
   global.fetch = async (url, init = {}) => {
     const step = steps.shift();
-    const urlString = typeof url === "string" ? url : url.toString();
-    const parsedUrl = new URL(urlString);
-    const method = init.method ?? "GET";
-    const body = init.body?.toString() ?? "";
-    const call = { url: parsedUrl, urlString, method, init, body };
+    const call = {
+      url: new URL(typeof url === "string" ? url : url.toString()),
+      method: init.method ?? "GET",
+      init,
+      body: init.body?.toString() ?? ""
+    };
     calls.push(call);
-
-    assert.ok(step, `Unexpected fetch call: ${method} ${urlString}`);
+    assert.ok(step, `Unexpected fetch call: ${call.method} ${call.url}`);
     step.assert?.(call);
-
     return jsonResponse(step.payload, step.status ?? 200);
   };
-
   return calls;
 }
 
-function authCodeStep(payload, assertRequest) {
+function authCodeStep(payload) {
   return {
     payload,
     assert: (call) => {
       assert.equal(call.method, "POST");
       assert.match(call.body, /grant_type=authorization_code/);
       assert.match(call.body, /code=/);
-      assertRequest?.(call);
     }
   };
 }
 
-function installedLocationsStep(payload, assertRequest) {
-  return {
-    payload,
-    assert: (call) => {
-      assert.equal(call.method, "GET");
-      assert.equal(call.url.pathname, "/oauth/installed-locations");
-      assert.equal(call.url.searchParams.get("companyId"), "company_1");
-      assert.equal(call.url.searchParams.get("appId"), "marketplace-app");
-      assert.equal(call.url.searchParams.get("isInstalled"), "true");
-      assert.equal(call.url.searchParams.get("pageSize"), "100");
-      assert.equal(call.init.headers.Version, "v3");
-      assertRequest?.(call);
-    }
-  };
-}
-
-function locationTokenStep(locationId, payload, assertRequest) {
+function locationTokenStep(locationId, payload) {
   return {
     payload,
     assert: (call) => {
@@ -222,501 +284,604 @@ function locationTokenStep(locationId, payload, assertRequest) {
       assert.equal(call.url.pathname, "/oauth/location-token");
       assert.equal(call.body, `companyId=company_1&locationId=${encodeURIComponent(locationId)}`);
       assert.equal(call.init.headers.Version, "v3");
-      assertRequest?.(call);
     }
   };
 }
 
-test("direct Location authorization-code token creates an unknown tenant and OAuth row without GHL_LOCATION_ID", async () => {
-  const locAToken = buildTokenRow("loc_A", "access_A", "refresh_A", {
-    tenant_id: "tenant_A",
-    company_id: "company_A"
+function companyPayload(overrides = {}) {
+  return {
+    accessToken: "company_access",
+    refreshToken: "company_refresh",
+    expiresIn: 3600,
+    companyId: "company_1",
+    userType: "Company",
+    appId: "marketplace-app",
+    ...overrides
+  };
+}
+
+function locationPayload(locationId, suffix = locationId) {
+  return {
+    accessToken: `access_${suffix}`,
+    refreshToken: `refresh_${suffix}`,
+    expiresIn: 3600,
+    locationId,
+    companyId: "company_1",
+    scope: "oauth.readonly oauth.write",
+    tokenType: "Bearer"
+  };
+}
+
+function requestApp(input) {
+  return new Promise((resolve, reject) => {
+    const app = createApp();
+    const server = app.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      const rawBody = typeof input.body === "string" ? input.body : JSON.stringify(input.body);
+      const request = http.request(
+        {
+          hostname: "127.0.0.1",
+          port: address.port,
+          path: input.path,
+          method: input.method ?? "POST",
+          headers: {
+            "content-type": "application/json",
+            "content-length": Buffer.byteLength(rawBody),
+            ...(input.headers ?? {})
+          }
+        },
+        (response) => {
+          const chunks = [];
+          response.on("data", (chunk) => chunks.push(chunk));
+          response.on("end", () => {
+            const responseText = Buffer.concat(chunks).toString("utf8");
+            server.close((closeError) => {
+              if (closeError) {
+                reject(closeError);
+                return;
+              }
+
+              resolve({
+                status: response.statusCode,
+                body: responseText ? JSON.parse(responseText) : null
+              });
+            });
+          });
+        }
+      );
+      request.on("error", (error) => server.close(() => reject(error)));
+      request.end(rawBody);
+    });
+    server.on("error", reject);
   });
-  const originalLocA = clone(locAToken);
-  const { rows, tenants } = setupOAuthStore({
-    initialTokens: [["loc_A", locAToken]]
-  });
+}
 
-  createFetchSequence([
-    authCodeStep({
-      access_token: "access_new",
-      refresh_token: "refresh_new",
-      expires_in: 3600,
-      location_id: "loc_new",
-      company_id: "company_new",
-      scope: "oauth.readonly oauth.write",
-      token_type: "Bearer"
-    })
-  ]);
+test("AppInstall entrypoint accepts a signed INSTALL payload and reaches reconciliation", async () => {
+  let reconciliationInput;
+  signatureVerifier.verifyGhlWebhookSignature = ({ rawBody, ghlSignature }) => {
+    assert.equal(ghlSignature, "signature-sensitive-value");
+    assert.match(rawBody.toString("utf8"), /loc_entry_valid/);
+    return true;
+  };
+  oauthService.recordGhlAppInstall = async (input) => {
+    reconciliationInput = input;
+    return {
+      status: "completed_locations",
+      locations: [{
+        location_id: input.locationId,
+        tenant_id: "tenant_entry_valid",
+        token_present: true,
+        refresh_token_present: true,
+        expires_at: "2999-01-01T00:00:00.000Z"
+      }],
+      failed_location_ids: [],
+      tenant_id: "tenant_entry_valid"
+    };
+  };
 
-  const installStatus = await oauthService.exchangeGhlAuthorizationCode("mock-code-direct-location");
-
-  assert.equal(installStatus.location_id, "loc_new");
-  assert.equal(installStatus.token_present, true);
-  assert.equal(installStatus.refresh_token_present, true);
-  assert.equal(tenants.get("loc_new").id, "tenant_loc_new");
-  assert.equal(rows.get("loc_new").tenant_id, "tenant_loc_new");
-  assert.equal(rows.get("loc_new").location_id, "loc_new");
-  assert.equal(rows.get("loc_new").company_id, "company_new");
-  assert.deepEqual(rows.get("loc_new").scopes, ["oauth.readonly", "oauth.write"]);
-  assert.equal(rows.get("loc_new").token_type, "Bearer");
-  assert.deepEqual(rows.get("loc_A"), originalLocA);
-});
-
-test("direct Location authorization-code token parses camelCase fields", async () => {
-  const { rows, tenants } = setupOAuthStore();
-
-  createFetchSequence([
-    authCodeStep({
-      accessToken: "access_camel",
-      refreshToken: "refresh_camel",
-      expiresIn: 3600,
-      locationId: "loc_camel",
-      companyId: "company_camel",
-      scopes: "oauth.readonly oauth.write",
-      tokenType: "Bearer"
-    })
-  ]);
-
-  const installStatus = await oauthService.exchangeGhlAuthorizationCode("mock-code-camel-location");
-
-  assert.equal(installStatus.location_id, "loc_camel");
-  assert.equal(tenants.get("loc_camel").id, "tenant_loc_camel");
-  assert.equal(rows.get("loc_camel").tenant_id, "tenant_loc_camel");
-  assert.equal(rows.get("loc_camel").access_token, "access_camel");
-  assert.equal(rows.get("loc_camel").refresh_token, "refresh_camel");
-  assert.equal(rows.get("loc_camel").company_id, "company_camel");
-  assert.deepEqual(rows.get("loc_camel").scopes, ["oauth.readonly", "oauth.write"]);
-  assert.equal(rows.get("loc_camel").token_type, "Bearer");
-});
-
-test("Company token with one approvedLocations entry converts and stores one location OAuth row", async () => {
-  const { rows, tenants } = setupOAuthStore();
-
-  createFetchSequence([
-    authCodeStep({
-      accessToken: "company_access",
-      refreshToken: "company_refresh",
-      expiresIn: 3600,
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "signature-sensitive-value" },
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
       companyId: "company_1",
-      userType: "Company",
-      approvedLocations: ["loc_B"],
-      isBulkInstallation: false,
-      appId: "app_from_response",
-      versionId: "version_5"
-    }),
-    locationTokenStep("loc_B", {
-      accessToken: "access_B",
-      refreshToken: "refresh_B",
-      expiresIn: 3600,
-      locationId: "loc_B",
-      companyId: "company_1",
-      scope: "oauth.readonly oauth.write",
-      tokenType: "Bearer"
-    })
-  ]);
-
-  const installStatus = await oauthService.exchangeGhlAuthorizationCode("mock-code-company-one");
-
-  assert.equal(installStatus.mode, "company_to_location");
-  assert.equal(installStatus.company_id, "company_1");
-  assert.deepEqual(installStatus.locations.map((location) => location.location_id), ["loc_B"]);
-  assert.equal(installStatus.locations[0].tenant_id, "tenant_B");
-  assert.equal(tenants.get("loc_B").id, "tenant_B");
-  assert.equal(rows.get("loc_B").tenant_id, "tenant_B");
-  assert.equal(rows.get("loc_B").access_token, "access_B");
-  assert.equal(rows.get("loc_B").refresh_token, "refresh_B");
-});
-
-test("Company token with two approvedLocations entries creates separate tenants and token rows", async () => {
-  const locAToken = buildTokenRow("loc_A", "access_A", "refresh_A", { tenant_id: "tenant_A" });
-  const originalLocA = clone(locAToken);
-  const { rows, tenants } = setupOAuthStore({
-    initialTokens: [["loc_A", locAToken]]
+      locationId: "loc_entry_valid",
+      webhookId: "entry-valid",
+      accessToken: "token-sensitive-value"
+    }
   });
 
-  createFetchSequence([
-    authCodeStep({
-      access_token: "company_access",
-      refresh_token: "company_refresh",
-      expires_in: 3600,
-      company_id: "company_1",
-      user_type: "Company",
-      approved_locations: [{ _id: "loc_B" }, { locationId: "loc_C" }],
-      is_bulk_installation: true
-    }),
-    locationTokenStep("loc_B", {
-      accessToken: "access_B",
-      refreshToken: "refresh_B",
-      expiresIn: 3600,
-      locationId: "loc_B",
-      companyId: "company_1",
-      scope: "oauth.readonly oauth.write",
-      tokenType: "Bearer"
-    }),
-    locationTokenStep("loc_C", {
-      accessToken: "access_C",
-      refreshToken: "refresh_C",
-      expiresIn: 3600,
-      locationId: "loc_C",
-      companyId: "company_1",
-      scope: "oauth.readonly",
-      tokenType: "Bearer"
-    })
-  ]);
-
-  const installStatus = await oauthService.exchangeGhlAuthorizationCode("mock-code-company-two");
-
-  assert.equal(installStatus.mode, "company_to_location");
-  assert.deepEqual(installStatus.locations.map((location) => location.location_id), ["loc_B", "loc_C"]);
-  assert.equal(tenants.get("loc_B").id, "tenant_B");
-  assert.equal(tenants.get("loc_C").id, "tenant_loc_C");
-  assert.equal(rows.get("loc_B").access_token, "access_B");
-  assert.equal(rows.get("loc_B").tenant_id, "tenant_B");
-  assert.equal(rows.get("loc_C").access_token, "access_C");
-  assert.equal(rows.get("loc_C").tenant_id, "tenant_loc_C");
-  assert.deepEqual(rows.get("loc_A"), originalLocA);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.status, "completed_locations");
+  assert.equal(reconciliationInput.locationId, "loc_entry_valid");
+  assert.equal(reconciliationInput.deliveryKey, "webhook:entry-valid");
+  assert.doesNotMatch(JSON.stringify(response.body), /token-sensitive-value|signature-sensitive-value/);
 });
 
-test("Company token without approvedLocations uses installed-locations lookup", async () => {
-  const { rows } = setupOAuthStore();
+test("AppInstall entrypoint rejects a missing signature before reconciliation", async () => {
+  oauthService.recordGhlAppInstall = async () => {
+    throw new Error("reconciliation must not run");
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1",
+      locationId: "loc_unsigned"
+    }
+  });
+
+  assert.equal(response.status, 401);
+  assert.equal(response.body.error, "Invalid HighLevel webhook signature");
+});
+
+test("AppInstall entrypoint rejects an invalid signature before reconciliation", async () => {
+  oauthService.recordGhlAppInstall = async () => {
+    throw new Error("reconciliation must not run");
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "invalid-signature" },
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1",
+      locationId: "loc_invalid_signature"
+    }
+  });
+
+  assert.equal(response.status, 401);
+  assert.equal(response.body.error, "Invalid HighLevel webhook signature");
+});
+
+test("AppInstall entrypoint ignores a signed payload for another appId", async () => {
+  signatureVerifier.verifyGhlWebhookSignature = () => true;
+  oauthService.recordGhlAppInstall = async () => {
+    throw new Error("reconciliation must not run");
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "valid-test-signature" },
+    body: {
+      type: "INSTALL",
+      appId: "other-app",
+      companyId: "company_1",
+      locationId: "loc_wrong_app"
+    }
+  });
+
+  assert.equal(response.status, 202);
+  assert.deepEqual(response.body, { ok: true, ignored: true, reason: "app_id_mismatch" });
+});
+
+test("AppInstall entrypoint rejects a signed INSTALL payload without locationId", async () => {
+  signatureVerifier.verifyGhlWebhookSignature = () => true;
+  oauthService.recordGhlAppInstall = async () => {
+    throw new Error("reconciliation must not run");
+  };
+
+  const response = await requestApp({
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "valid-test-signature" },
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1"
+    }
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.error, "Invalid HighLevel AppInstall payload");
+});
+
+test("AppInstall entrypoint keeps duplicate delivery idempotent end to end", async () => {
+  const store = setupOAuthStore();
+  store.sessions.set(store.sessionKey("marketplace-app", "company_1"), {
+    id: "session_entry_duplicate",
+    app_id: "marketplace-app",
+    company_id: "company_1",
+    access_token: "company_access",
+    status: "active",
+    expires_at: "2999-01-01T00:00:00.000Z",
+    last_reconciled_at: null,
+    error_code: null,
+    created_at: "2026-07-11T00:00:00.000Z",
+    updated_at: "2026-07-11T00:00:00.000Z"
+  });
+  signatureVerifier.verifyGhlWebhookSignature = () => true;
   const calls = createFetchSequence([
-    authCodeStep({
-      accessToken: "company_access",
-      refreshToken: "company_refresh",
-      expiresIn: 3600,
-      companyId: "company_1",
-      userType: "Company"
-    }),
-    installedLocationsStep({
-      items: [{ _id: "loc_D" }]
-    }),
-    locationTokenStep("loc_D", {
-      accessToken: "access_D",
-      refreshToken: "refresh_D",
-      expiresIn: 3600,
-      locationId: "loc_D",
-      companyId: "company_1",
-      scope: "oauth.readonly oauth.write",
-      tokenType: "Bearer"
-    })
+    locationTokenStep("loc_entry_duplicate", locationPayload("loc_entry_duplicate"))
   ]);
+  const request = {
+    path: "/webhooks/ghl/app-install",
+    headers: { "x-ghl-signature": "valid-test-signature" },
+    body: {
+      type: "INSTALL",
+      appId: "marketplace-app",
+      companyId: "company_1",
+      locationId: "loc_entry_duplicate",
+      webhookId: "entry-duplicate"
+    }
+  };
 
-  const installStatus = await oauthService.exchangeGhlAuthorizationCode("mock-code-company-installed");
+  const first = await requestApp(request);
+  const second = await requestApp(request);
 
-  assert.equal(installStatus.mode, "company_to_location");
-  assert.deepEqual(installStatus.locations.map((location) => location.location_id), ["loc_D"]);
-  assert.equal(rows.get("loc_D").tenant_id, "tenant_loc_D");
-  assert.equal(rows.get("loc_D").access_token, "access_D");
-  assert.equal(calls.filter((call) => call.url.pathname === "/oauth/installed-locations").length, 1);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(store.tokens.get("loc_entry_duplicate").tenant_id, "tenant_loc_entry_duplicate");
 });
 
-test("installed-locations lookup supports pagination", async () => {
-  const { rows } = setupOAuthStore();
+test("request logging redacts OAuth codes, tokens, and webhook signatures", () => {
+  const redactedUrl = redactSensitiveUrlQuery(
+    "/oauth/callback?code=authorization-sensitive&accessToken=token-sensitive"
+  );
+  const redactedHeaders = redactRequestHeaders({
+    authorization: "Bearer authorization-sensitive",
+    "x-ghl-signature": "signature-sensitive",
+    "x-wh-signature": "legacy-signature-sensitive"
+  });
+  const serialized = JSON.stringify({ redactedUrl, redactedHeaders });
+
+  assert.doesNotMatch(serialized, /authorization-sensitive|token-sensitive|signature-sensitive/);
+  assert.match(serialized, /\[redacted\]/);
+});
+
+test("direct Location OAuth creates the exact unknown tenant and token without GHL_LOCATION_ID", async () => {
+  const store = setupOAuthStore();
+  createFetchSequence([authCodeStep(locationPayload("loc_direct"))]);
+
+  const result = await oauthService.exchangeGhlAuthorizationCode("direct-code");
+
+  assert.equal(result.mode, "direct_location");
+  assert.equal(result.status, "direct_location");
+  assert.equal(result.location_id, "loc_direct");
+  assert.equal(store.tenants.get("loc_direct").id, "tenant_loc_direct");
+  assert.equal(store.tokens.get("loc_direct").tenant_id, "tenant_loc_direct");
+  assert.equal(store.tokens.has("legacy_global_location"), false);
+});
+
+test("direct Location OAuth continues parsing snake_case token responses", async () => {
+  const store = setupOAuthStore();
+  createFetchSequence([authCodeStep({
+    access_token: "access_snake",
+    refresh_token: "refresh_snake",
+    expires_in: 3600,
+    location_id: "loc_snake",
+    company_id: "company_snake",
+    scope: "oauth.readonly oauth.write",
+    token_type: "Bearer"
+  })]);
+
+  const result = await oauthService.exchangeGhlAuthorizationCode("direct-snake-code");
+
+  assert.equal(result.mode, "direct_location");
+  assert.equal(result.location_id, "loc_snake");
+  assert.equal(store.tokens.get("loc_snake").tenant_id, "tenant_loc_snake");
+  assert.equal(store.tokens.get("loc_snake").company_id, "company_snake");
+  assert.deepEqual(store.tokens.get("loc_snake").scopes, ["oauth.readonly", "oauth.write"]);
+});
+
+test("Company callback before AppInstall waits, then converts only the newly installed location", async () => {
+  const oldA = buildTokenRow("loc_old_A", "access_old_A", "refresh_old_A");
+  const oldB = buildTokenRow("loc_old_B", "access_old_B", "refresh_old_B");
+  const originalA = clone(oldA);
+  const originalB = clone(oldB);
+  const store = setupOAuthStore({ initialTokens: [["loc_old_A", oldA], ["loc_old_B", oldB]] });
   const calls = createFetchSequence([
-    authCodeStep({
-      accessToken: "company_access",
-      refreshToken: "company_refresh",
-      expiresIn: 3600,
-      companyId: "company_1",
-      userType: "Company"
-    }),
-    installedLocationsStep({
-      items: [{ _id: "loc_E1" }],
-      nextPageToken: "page_2"
-    }),
-    installedLocationsStep(
-      {
-        items: [{ _id: "loc_E2" }]
-      },
-      (call) => {
-        assert.equal(call.url.searchParams.get("pageToken"), "page_2");
-      }
-    ),
-    locationTokenStep("loc_E1", {
-      accessToken: "access_E1",
-      refreshToken: "refresh_E1",
-      expiresIn: 3600,
-      locationId: "loc_E1",
-      companyId: "company_1",
-      scope: "oauth.readonly",
-      tokenType: "Bearer"
-    }),
-    locationTokenStep("loc_E2", {
-      accessToken: "access_E2",
-      refreshToken: "refresh_E2",
-      expiresIn: 3600,
-      locationId: "loc_E2",
-      companyId: "company_1",
-      scope: "oauth.readonly",
-      tokenType: "Bearer"
-    })
+    authCodeStep(companyPayload({ approvedLocations: ["loc_old_A", "loc_old_B"] })),
+    locationTokenStep("6xxYwgQMsf0kTFkUfinO", locationPayload("6xxYwgQMsf0kTFkUfinO", "new"))
   ]);
 
-  const installStatus = await oauthService.exchangeGhlAuthorizationCode("mock-code-company-paged");
+  const callback = await oauthService.exchangeGhlAuthorizationCode("company-code");
+  assert.equal(callback.status, "pending_app_install");
+  assert.deepEqual(callback.locations, []);
 
-  assert.deepEqual(installStatus.locations.map((location) => location.location_id), ["loc_E1", "loc_E2"]);
-  assert.equal(rows.get("loc_E1").access_token, "access_E1");
-  assert.equal(rows.get("loc_E2").access_token, "access_E2");
-  assert.equal(calls.filter((call) => call.url.pathname === "/oauth/installed-locations").length, 2);
-});
-
-test("location-token response location mismatch fails closed and stores nothing", async () => {
-  const locAToken = buildTokenRow("loc_A", "access_A", "refresh_A", { tenant_id: "tenant_A" });
-  const originalLocA = clone(locAToken);
-  const { rows } = setupOAuthStore({
-    initialTokens: [["loc_A", locAToken]]
+  const install = await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app",
+    companyId: "company_1",
+    locationId: "6xxYwgQMsf0kTFkUfinO",
+    deliveryKey: "webhook:new-location"
   });
 
+  assert.equal(install.status, "completed_locations");
+  assert.equal(store.tokens.get("6xxYwgQMsf0kTFkUfinO").tenant_id, "tenant_6xxYwgQMsf0kTFkUfinO");
+  assert.deepEqual(store.tokens.get("loc_old_A"), originalA);
+  assert.deepEqual(store.tokens.get("loc_old_B"), originalB);
+  assert.equal(calls.some((call) => call.url.pathname === "/oauth/installed-locations"), false);
+});
+
+test("AppInstall before Company callback is durably completed by the callback", async () => {
+  const store = setupOAuthStore();
+  const pending = await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app", companyId: "company_1", locationId: "loc_before", deliveryKey: "webhook:before"
+  });
+  assert.equal(pending.status, "pending_app_install");
+
   createFetchSequence([
-    authCodeStep({
-      accessToken: "company_access",
-      refreshToken: "company_refresh",
-      expiresIn: 3600,
-      companyId: "company_1",
-      userType: "Company",
-      approvedLocations: ["loc_F"]
+    authCodeStep(companyPayload()),
+    locationTokenStep("loc_before", locationPayload("loc_before"))
+  ]);
+  const callback = await oauthService.exchangeGhlAuthorizationCode("company-code-after-event");
+
+  assert.equal(callback.status, "completed_locations");
+  assert.equal(store.tokens.get("loc_before").tenant_id, "tenant_loc_before");
+  assert.equal(store.pending.get(store.pendingKey("marketplace-app", "company_1", "loc_before")).status, "completed");
+});
+
+test("duplicate INSTALL delivery is idempotent and does not request a second location token", async () => {
+  const store = setupOAuthStore();
+  createFetchSequence([
+    authCodeStep(companyPayload()),
+    locationTokenStep("loc_duplicate", locationPayload("loc_duplicate"))
+  ]);
+  await oauthService.exchangeGhlAuthorizationCode("company-code");
+  const first = await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app", companyId: "company_1", locationId: "loc_duplicate", deliveryKey: "webhook:same"
+  });
+  const tokenAfterFirst = clone(store.tokens.get("loc_duplicate"));
+  const second = await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app", companyId: "company_1", locationId: "loc_duplicate", deliveryKey: "webhook:same"
+  });
+
+  assert.equal(first.status, "completed_locations");
+  assert.equal(second.status, "completed_locations");
+  assert.deepEqual(store.tokens.get("loc_duplicate"), tokenAfterFirst);
+});
+
+test("existing-location reinstall with a new delivery updates only that location token", async () => {
+  const oldTarget = buildTokenRow("loc_reinstall", "access_old", "refresh_old");
+  const unrelated = buildTokenRow("loc_unrelated", "access_unrelated", "refresh_unrelated");
+  const originalUnrelated = clone(unrelated);
+  const store = setupOAuthStore({ initialTokens: [["loc_reinstall", oldTarget], ["loc_unrelated", unrelated]] });
+  store.pending.set(store.pendingKey("marketplace-app", "company_1", "loc_reinstall"), {
+    id: "pending_existing", app_id: "marketplace-app", company_id: "company_1", location_id: "loc_reinstall",
+    tenant_id: "tenant_loc_reinstall", delivery_key: "webhook:old", status: "completed",
+    processing_started_at: null, completed_at: "2026-07-10T00:00:00.000Z", completed_session_id: "session_old",
+    error_code: null, created_at: "2026-07-10T00:00:00.000Z", updated_at: "2026-07-10T00:00:00.000Z"
+  });
+  createFetchSequence([
+    authCodeStep(companyPayload()),
+    locationTokenStep("loc_reinstall", locationPayload("loc_reinstall", "reinstalled"))
+  ]);
+  await oauthService.exchangeGhlAuthorizationCode("reinstall-code");
+  await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app", companyId: "company_1", locationId: "loc_reinstall", deliveryKey: "webhook:new"
+  });
+
+  assert.equal(store.tokens.get("loc_reinstall").access_token, "access_reinstalled");
+  assert.deepEqual(store.tokens.get("loc_unrelated"), originalUnrelated);
+});
+
+test("two close AppInstall locations under one company receive isolated location tokens", async () => {
+  const store = setupOAuthStore();
+  await Promise.all([
+    oauthService.recordGhlAppInstall({
+      appId: "marketplace-app", companyId: "company_1", locationId: "loc_close_A", deliveryKey: "webhook:close-a"
     }),
-    locationTokenStep("loc_F", {
-      accessToken: "access_wrong",
-      refreshToken: "refresh_wrong",
+    oauthService.recordGhlAppInstall({
+      appId: "marketplace-app", companyId: "company_1", locationId: "loc_close_B", deliveryKey: "webhook:close-b"
+    })
+  ]);
+  createFetchSequence([
+    authCodeStep(companyPayload()),
+    locationTokenStep("loc_close_A", locationPayload("loc_close_A", "close_A")),
+    locationTokenStep("loc_close_B", locationPayload("loc_close_B", "close_B"))
+  ]);
+
+  const result = await oauthService.exchangeGhlAuthorizationCode("bulk-code");
+
+  assert.equal(result.status, "completed_locations");
+  assert.equal(store.tokens.get("loc_close_A").access_token, "access_close_A");
+  assert.equal(store.tokens.get("loc_close_B").access_token, "access_close_B");
+  assert.notEqual(store.tokens.get("loc_close_A").tenant_id, store.tokens.get("loc_close_B").tenant_id);
+});
+
+test("AppInstall appId mismatch fails before tenant or pending creation", async () => {
+  const store = setupOAuthStore();
+  await assert.rejects(
+    () => oauthService.recordGhlAppInstall({
+      appId: "other-app", companyId: "company_1", locationId: "loc_wrong_app", deliveryKey: "webhook:wrong-app"
+    }),
+    /did not match GHL_MARKETPLACE_APP_ID/
+  );
+  assert.equal(store.tenants.has("loc_wrong_app"), false);
+  assert.equal(store.pending.size, 0);
+});
+
+test("location-token response mismatch fails closed without modifying unrelated tokens", async () => {
+  const unrelated = buildTokenRow("loc_unrelated", "access_unrelated", "refresh_unrelated");
+  const original = clone(unrelated);
+  const store = setupOAuthStore({ initialTokens: [["loc_unrelated", unrelated]] });
+  await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app", companyId: "company_1", locationId: "loc_expected", deliveryKey: "webhook:mismatch"
+  });
+  createFetchSequence([
+    authCodeStep(companyPayload()),
+    locationTokenStep("loc_expected", locationPayload("loc_other", "wrong"))
+  ]);
+
+  const result = await oauthService.exchangeGhlAuthorizationCode("mismatch-code");
+
+  assert.equal(result.status, "failed");
+  assert.deepEqual(result.locations, []);
+  assert.equal(store.tokens.has("loc_expected"), false);
+  assert.equal(store.tokens.has("loc_other"), false);
+  assert.deepEqual(store.tokens.get("loc_unrelated"), original);
+});
+
+test("location-token response without access token fails closed", async () => {
+  const store = setupOAuthStore();
+  await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app",
+    companyId: "company_1",
+    locationId: "loc_missing_access",
+    deliveryKey: "webhook:missing-access"
+  });
+  createFetchSequence([
+    authCodeStep(companyPayload()),
+    locationTokenStep("loc_missing_access", {
+      refreshToken: "refresh_missing_access",
       expiresIn: 3600,
-      locationId: "loc_OTHER",
+      locationId: "loc_missing_access",
       companyId: "company_1",
       scope: "oauth.readonly",
       tokenType: "Bearer"
     })
   ]);
 
-  await assert.rejects(
-    () => oauthService.exchangeGhlAuthorizationCode("mock-code-company-mismatch"),
-    /did not match requested location loc_F/
-  );
-  assert.equal(rows.has("loc_F"), false);
-  assert.equal(rows.has("loc_OTHER"), false);
-  assert.deepEqual(rows.get("loc_A"), originalLocA);
+  const result = await oauthService.exchangeGhlAuthorizationCode("missing-access-code");
+
+  assert.equal(result.status, "failed");
+  assert.equal(store.tokens.has("loc_missing_access"), false);
 });
 
-test("location-token response missing access token fails closed and stores nothing", async () => {
-  const { rows } = setupOAuthStore();
-
-  createFetchSequence([
-    authCodeStep({
-      accessToken: "company_access",
-      refreshToken: "company_refresh",
-      expiresIn: 3600,
-      companyId: "company_1",
-      userType: "Company",
-      approvedLocations: ["loc_F2"]
-    }),
-    locationTokenStep("loc_F2", {
-      refreshToken: "refresh_F2",
-      expiresIn: 3600,
-      locationId: "loc_F2",
-      companyId: "company_1",
-      scope: "oauth.readonly",
-      tokenType: "Bearer"
-    })
-  ]);
+test("Company OAuth response without companyId fails safely", async () => {
+  const store = setupOAuthStore();
+  createFetchSequence([authCodeStep(companyPayload({ companyId: undefined }))]);
 
   await assert.rejects(
-    () => oauthService.exchangeGhlAuthorizationCode("mock-code-company-missing-location-access"),
-    /did not include a location-specific access token/
-  );
-  assert.equal(rows.has("loc_F2"), false);
-});
-
-test("Company token missing companyId fails safely", async () => {
-  const { rows } = setupOAuthStore();
-
-  createFetchSequence([
-    authCodeStep({
-      accessToken: "company_access",
-      refreshToken: "company_refresh",
-      expiresIn: 3600,
-      userType: "Company",
-      approvedLocations: ["loc_G"]
-    })
-  ]);
-
-  await assert.rejects(
-    () => oauthService.exchangeGhlAuthorizationCode("mock-code-missing-company"),
+    () => oauthService.exchangeGhlAuthorizationCode("missing-company-code"),
     /did not include companyId/
   );
-  assert.equal(rows.has("loc_G"), false);
+  assert.equal(store.sessions.size, 0);
+  assert.equal(store.tokens.size, 0);
 });
 
-test("Company token fallback without GHL_MARKETPLACE_APP_ID fails safely", async () => {
-  const { rows } = setupOAuthStore();
+test("Company OAuth correlation fails safely without GHL_MARKETPLACE_APP_ID", async () => {
+  const store = setupOAuthStore();
   config.env.GHL_MARKETPLACE_APP_ID = "";
-
-  createFetchSequence([
-    authCodeStep({
-      accessToken: "company_access",
-      refreshToken: "company_refresh",
-      expiresIn: 3600,
-      companyId: "company_1",
-      userType: "Company"
-    })
-  ]);
+  createFetchSequence([authCodeStep(companyPayload())]);
 
   await assert.rejects(
-    () => oauthService.exchangeGhlAuthorizationCode("mock-code-missing-app-id"),
+    () => oauthService.exchangeGhlAuthorizationCode("missing-marketplace-app-code"),
     /GHL_MARKETPLACE_APP_ID is required/
   );
-  assert.equal(rows.size, 0);
+  assert.equal(store.sessions.size, 0);
+  assert.equal(store.tokens.size, 0);
 });
 
-test("OAuth refresh remains scoped to the stored token row and preserves omitted metadata", async () => {
-  const locAToken = buildTokenRow("loc_A", "access_A", "refresh_A", {
-    tenant_id: "tenant_A",
-    company_id: "company_A",
-    scopes: ["oauth.readonly"],
-    token_type: "Bearer"
+test("missing Company onboarding session leaves exact install pending and stores no token", async () => {
+  const store = setupOAuthStore();
+  const result = await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app", companyId: "company_1", locationId: "loc_no_session", deliveryKey: "webhook:no-session"
   });
-  const originalLocA = clone(locAToken);
-  const { rows } = setupOAuthStore({
-    initialTokens: [
-      ["loc_A", locAToken],
-      [
-        "loc_B",
-        buildTokenRow("loc_B", "access_B", "refresh_B", {
-          tenant_id: "tenant_B",
-          company_id: "company_B",
-          scopes: ["oauth.readonly", "oauth.write"],
-          token_type: "Bearer"
-        })
-      ]
-    ]
+  assert.equal(result.status, "pending_app_install");
+  assert.equal(store.tokens.has("loc_no_session"), false);
+});
+
+test("expired Company onboarding session is invalidated and cannot create a location token", async () => {
+  const store = setupOAuthStore();
+  store.sessions.set(store.sessionKey("marketplace-app", "company_1"), {
+    id: "session_expired", app_id: "marketplace-app", company_id: "company_1", access_token: "expired_access",
+    status: "active", expires_at: "2000-01-01T00:00:00.000Z", last_reconciled_at: null, error_code: null,
+    created_at: "2000-01-01T00:00:00.000Z", updated_at: "2000-01-01T00:00:00.000Z"
   });
 
-  createFetchSequence([
-    {
-      payload: {
-        access_token: "access_B_refreshed",
-        refresh_token: "refresh_B_refreshed",
-        expires_in: 3600
-      },
-      assert: (call) => {
-        assert.equal(call.method, "POST");
-        assert.match(call.body, /grant_type=refresh_token/);
-        assert.match(call.body, /refresh_token=refresh_B/);
-      }
+  const result = await oauthService.recordGhlAppInstall({
+    appId: "marketplace-app", companyId: "company_1", locationId: "loc_expired", deliveryKey: "webhook:expired"
+  });
+
+  assert.equal(result.status, "pending_app_install");
+  assert.equal(store.sessions.get(store.sessionKey("marketplace-app", "company_1")).access_token, null);
+  assert.equal(store.tokens.has("loc_expired"), false);
+});
+
+test("OAuth refresh remains scoped to the stored location and preserves omitted metadata", async () => {
+  const locA = buildTokenRow("loc_A", "access_A", "refresh_A", { company_id: "company_A" });
+  const locB = buildTokenRow("loc_B", "access_B", "refresh_B", { company_id: "company_B" });
+  const originalA = clone(locA);
+  const store = setupOAuthStore({ initialTokens: [["loc_A", locA], ["loc_B", locB]] });
+  createFetchSequence([{
+    payload: { access_token: "access_B_refreshed", refresh_token: "refresh_B_refreshed", expires_in: 3600 },
+    assert: (call) => {
+      assert.match(call.body, /grant_type=refresh_token/);
+      assert.match(call.body, /refresh_token=refresh_B/);
     }
-  ]);
+  }]);
 
-  const refreshed = await oauthService.refreshGhlOAuthToken("loc_B");
-  assert.equal(refreshed.location_id, "loc_B");
-  assert.equal(refreshed.tenant_id, "tenant_B");
-  assert.deepEqual(rows.get("loc_A"), originalLocA);
-  assert.equal(rows.get("loc_B").tenant_id, "tenant_B");
-  assert.equal(rows.get("loc_B").company_id, "company_B");
-  assert.deepEqual(rows.get("loc_B").scopes, ["oauth.readonly", "oauth.write"]);
-  assert.equal(rows.get("loc_B").token_type, "Bearer");
-  assert.equal(rows.get("loc_B").access_token, "access_B_refreshed");
-  assert.equal(rows.get("loc_B").refresh_token, "refresh_B_refreshed");
+  await oauthService.refreshGhlOAuthToken("loc_B");
+
+  assert.deepEqual(store.tokens.get("loc_A"), originalA);
+  assert.equal(store.tokens.get("loc_B").tenant_id, "tenant_loc_B");
+  assert.equal(store.tokens.get("loc_B").company_id, "company_B");
+  assert.deepEqual(store.tokens.get("loc_B").scopes, ["oauth.readonly", "oauth.write"]);
+  assert.equal(store.tokens.get("loc_B").token_type, "Bearer");
+  assert.equal(store.tokens.get("loc_B").access_token, "access_B_refreshed");
+  assert.equal(store.tokens.get("loc_B").refresh_token, "refresh_B_refreshed");
 });
 
 test("OAuth refresh stores supplied metadata for the same location only", async () => {
-  const locAToken = buildTokenRow("loc_A", "access_A", "refresh_A", {
-    tenant_id: "tenant_A",
+  const locA = buildTokenRow("loc_A", "access_A", "refresh_A", {
     company_id: "company_A",
     scopes: ["oauth.readonly"],
     token_type: "Bearer"
   });
-  const originalLocA = clone(locAToken);
-  const { rows } = setupOAuthStore({
-    initialTokens: [
-      ["loc_A", locAToken],
-      [
-        "loc_B",
-        buildTokenRow("loc_B", "access_B", "refresh_B", {
-          tenant_id: "tenant_B",
-          company_id: "company_B",
-          scopes: ["oauth.readonly", "oauth.write"],
-          token_type: "Bearer"
-        })
-      ]
-    ]
+  const locB = buildTokenRow("loc_B", "access_B", "refresh_B", {
+    company_id: "company_B",
+    scopes: ["oauth.readonly", "oauth.write"],
+    token_type: "Bearer"
   });
-
-  createFetchSequence([
-    {
-      payload: {
-        accessToken: "access_B_refreshed_with_metadata",
-        refreshToken: "refresh_B_refreshed_with_metadata",
-        expiresIn: 3600,
-        companyId: "company_B_updated",
-        scopes: ["oauth.readonly"],
-        tokenType: "BearerV2"
-      },
-      assert: (call) => {
-        assert.equal(call.method, "POST");
-        assert.match(call.body, /grant_type=refresh_token/);
-        assert.match(call.body, /refresh_token=refresh_B/);
-      }
+  const originalA = clone(locA);
+  const store = setupOAuthStore({ initialTokens: [["loc_A", locA], ["loc_B", locB]] });
+  createFetchSequence([{
+    payload: {
+      accessToken: "access_B_refreshed_with_metadata",
+      refreshToken: "refresh_B_refreshed_with_metadata",
+      expiresIn: 3600,
+      companyId: "company_B_updated",
+      scopes: ["oauth.readonly"],
+      tokenType: "BearerV2"
+    },
+    assert: (call) => {
+      assert.match(call.body, /grant_type=refresh_token/);
+      assert.match(call.body, /refresh_token=refresh_B/);
     }
-  ]);
+  }]);
 
-  const refreshed = await oauthService.refreshGhlOAuthToken("loc_B");
-  assert.equal(refreshed.location_id, "loc_B");
-  assert.equal(refreshed.tenant_id, "tenant_B");
-  assert.deepEqual(rows.get("loc_A"), originalLocA);
-  assert.equal(rows.get("loc_B").tenant_id, "tenant_B");
-  assert.equal(rows.get("loc_B").company_id, "company_B_updated");
-  assert.deepEqual(rows.get("loc_B").scopes, ["oauth.readonly"]);
-  assert.equal(rows.get("loc_B").token_type, "BearerV2");
-  assert.equal(rows.get("loc_B").access_token, "access_B_refreshed_with_metadata");
-  assert.equal(rows.get("loc_B").refresh_token, "refresh_B_refreshed_with_metadata");
+  await oauthService.refreshGhlOAuthToken("loc_B");
+
+  assert.deepEqual(store.tokens.get("loc_A"), originalA);
+  assert.equal(store.tokens.get("loc_B").tenant_id, "tenant_loc_B");
+  assert.equal(store.tokens.get("loc_B").company_id, "company_B_updated");
+  assert.deepEqual(store.tokens.get("loc_B").scopes, ["oauth.readonly"]);
+  assert.equal(store.tokens.get("loc_B").token_type, "BearerV2");
+  assert.equal(store.tokens.get("loc_B").access_token, "access_B_refreshed_with_metadata");
+  assert.equal(store.tokens.get("loc_B").refresh_token, "refresh_B_refreshed_with_metadata");
 });
 
-test("missing OAuth token fails safely without using another tenant token", async () => {
-  const locAToken = buildTokenRow("loc_A", "access_A", "refresh_A", { tenant_id: "tenant_A" });
-  const originalLocA = clone(locAToken);
-  const { rows } = setupOAuthStore({
-    initialTokens: [["loc_A", locAToken]]
-  });
+test("missing OAuth token fails safely without selecting another tenant token", async () => {
+  const locA = buildTokenRow("loc_A", "access_A", "refresh_A");
+  const originalA = clone(locA);
+  const store = setupOAuthStore({ initialTokens: [["loc_A", locA]] });
 
   await assert.rejects(
     () => oauthService.getGhlAuthContext("loc_missing", { allowPrivateFallback: false }),
     /No HighLevel OAuth token is stored for location loc_missing/
   );
-  assert.deepEqual(rows.get("loc_A"), originalLocA);
-  assert.equal(rows.has("loc_missing"), false);
+
+  assert.deepEqual(store.tokens.get("loc_A"), originalA);
+  assert.equal(store.tokens.has("loc_missing"), false);
 });
 
-test("LINE outbound channel selection stays isolated by tenant", async () => {
+test("LINE outbound channel selection remains tenant-isolated and fails closed", async () => {
   const channels = new Map([
-    [
-      "line_channel_A",
-      {
-        id: "line_channel_A",
-        tenant_id: "tenant_A",
-        webhook_key: "webhook_A",
-        channel_access_token: "line_token_A",
-        channel_secret: "line_secret_A",
-        is_active: true
-      }
-    ],
-    [
-      "line_channel_B",
-      {
-        id: "line_channel_B",
-        tenant_id: "tenant_B",
-        webhook_key: "webhook_B",
-        channel_access_token: "line_token_B",
-        channel_secret: "line_secret_B",
-        is_active: true
-      }
-    ]
+    ["line_A", { id: "line_A", tenant_id: "tenant_A", webhook_key: "webhook_A", channel_access_token: "line_token_A", channel_secret: "line_secret_A", is_active: true }],
+    ["line_B", { id: "line_B", tenant_id: "tenant_B", webhook_key: "webhook_B", channel_access_token: "line_token_B", channel_secret: "line_secret_B", is_active: true }]
   ]);
-
-  repository.getLineChannelById = async (lineChannelId) => channels.get(lineChannelId) ?? null;
+  repository.getLineChannelById = async (id) => channels.get(id) ?? null;
   repository.getLineChannelByTenantId = async (tenantId) =>
     [...channels.values()].find((channel) => channel.tenant_id === tenantId) ?? null;
 
   const profileChannelSelection = await lineOutbound.resolveLineChannelForOutbound("tenant_B", {
-    line_channel_id: "line_channel_B"
+    line_channel_id: "line_B"
   });
   assert.equal(profileChannelSelection.channelAccessToken, "line_token_B");
   assert.equal(profileChannelSelection.channelTokenSource, "profile_channel");
@@ -728,10 +893,7 @@ test("LINE outbound channel selection stays isolated by tenant", async () => {
   assert.equal(tenantChannelSelection.channelTokenSource, "tenant_active_channel");
 
   await assert.rejects(
-    () =>
-      lineOutbound.resolveLineChannelForOutbound("tenant_missing", {
-        line_channel_id: null
-      }),
+    () => lineOutbound.resolveLineChannelForOutbound("tenant_missing", { line_channel_id: null }),
     (error) => {
       assert.equal(error.name, "LineChannelNotConnectedError");
       assert.equal(error.channelTokenSource, "tenant_active_channel");

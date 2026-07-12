@@ -111,6 +111,35 @@ export type UpsertGhlOAuthTokenInput = {
   tokenType?: string;
 };
 
+export type GhlOAuthOnboardingSessionRecord = {
+  id: string;
+  app_id: string;
+  company_id: string;
+  access_token: string | null;
+  status: "active" | "expired" | "failed";
+  expires_at: string;
+  last_reconciled_at: string | null;
+  error_code: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type GhlPendingAppInstallRecord = {
+  id: string;
+  app_id: string;
+  company_id: string;
+  location_id: string;
+  tenant_id: string;
+  delivery_key: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  processing_started_at: string | null;
+  completed_at: string | null;
+  completed_session_id: string | null;
+  error_code: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type UpsertLineChannelInput = {
   tenantId: string;
   webhookKey: string;
@@ -284,6 +313,275 @@ export async function getGhlOAuthTokenStatus(locationId: string): Promise<{
     scopes: token.scopes ?? [],
     company_id: token.company_id
   };
+}
+
+export async function upsertGhlOAuthOnboardingSession(input: {
+  appId: string;
+  companyId: string;
+  accessToken: string;
+  expiresAt: string;
+}): Promise<GhlOAuthOnboardingSessionRecord> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("ghl_oauth_onboarding_sessions")
+    .upsert(
+      {
+        app_id: input.appId,
+        company_id: input.companyId,
+        access_token: input.accessToken,
+        status: "active",
+        expires_at: input.expiresAt,
+        last_reconciled_at: null,
+        error_code: null,
+        updated_at: new Date().toISOString()
+      },
+      { onConflict: "app_id,company_id" }
+    )
+    .select("*")
+    .single();
+
+  return requireSingle<GhlOAuthOnboardingSessionRecord>(data, error);
+}
+
+export async function getActiveGhlOAuthOnboardingSession(
+  appId: string,
+  companyId: string
+): Promise<GhlOAuthOnboardingSessionRecord | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("ghl_oauth_onboarding_sessions")
+    .select("*")
+    .eq("app_id", appId)
+    .eq("company_id", companyId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const session = data as GhlOAuthOnboardingSessionRecord | null;
+
+  if (!session || session.status !== "active" || !session.access_token) {
+    return null;
+  }
+
+  if (new Date(session.expires_at).getTime() > Date.now()) {
+    return session;
+  }
+
+  const { error: expireError } = await supabase
+    .from("ghl_oauth_onboarding_sessions")
+    .update({
+      access_token: null,
+      status: "expired",
+      error_code: "oauth_onboarding_session_expired",
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", session.id)
+    .eq("status", "active");
+
+  if (expireError) {
+    throw new Error(expireError.message);
+  }
+
+  return null;
+}
+
+export async function markGhlOAuthOnboardingSessionReconciled(sessionId: string): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from("ghl_oauth_onboarding_sessions")
+    .update({
+      last_reconciled_at: new Date().toISOString(),
+      error_code: null,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", sessionId)
+    .eq("status", "active");
+
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+export async function upsertPendingGhlAppInstall(input: {
+  appId: string;
+  companyId: string;
+  locationId: string;
+  tenantId: string;
+  deliveryKey: string;
+}): Promise<GhlPendingAppInstallRecord> {
+  const supabase = getSupabase();
+  const insertPayload = {
+    app_id: input.appId,
+    company_id: input.companyId,
+    location_id: input.locationId,
+    tenant_id: input.tenantId,
+    delivery_key: input.deliveryKey,
+    status: "pending",
+    error_code: null
+  };
+  const { data, error } = await supabase
+    .from("ghl_pending_app_installs")
+    .insert(insertPayload)
+    .select("*")
+    .single();
+
+  if (!error) {
+    return requireSingle<GhlPendingAppInstallRecord>(data, null);
+  }
+
+  if (error.code !== "23505") {
+    throw new Error(error.message);
+  }
+
+  const { data: existingData, error: existingError } = await supabase
+    .from("ghl_pending_app_installs")
+    .select("*")
+    .eq("app_id", input.appId)
+    .eq("company_id", input.companyId)
+    .eq("location_id", input.locationId)
+    .single();
+  const existing = requireSingle<GhlPendingAppInstallRecord>(existingData, existingError);
+
+  if (existing.delivery_key === input.deliveryKey) {
+    return existing;
+  }
+
+  const { data: reinstalledData, error: reinstalledError } = await supabase
+    .from("ghl_pending_app_installs")
+    .update({
+      tenant_id: input.tenantId,
+      delivery_key: input.deliveryKey,
+      status: "pending",
+      processing_started_at: null,
+      completed_at: null,
+      completed_session_id: null,
+      error_code: null,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", existing.id)
+    .select("*")
+    .single();
+
+  return requireSingle<GhlPendingAppInstallRecord>(reinstalledData, reinstalledError);
+}
+
+export async function getGhlPendingAppInstall(
+  appId: string,
+  companyId: string,
+  locationId: string
+): Promise<GhlPendingAppInstallRecord | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("ghl_pending_app_installs")
+    .select("*")
+    .eq("app_id", appId)
+    .eq("company_id", companyId)
+    .eq("location_id", locationId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return data as GhlPendingAppInstallRecord | null;
+}
+
+export async function listReconcileableGhlAppInstalls(
+  appId: string,
+  companyId: string
+): Promise<GhlPendingAppInstallRecord[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("ghl_pending_app_installs")
+    .select("*")
+    .eq("app_id", appId)
+    .eq("company_id", companyId)
+    .in("status", ["pending", "failed"])
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return (data ?? []) as GhlPendingAppInstallRecord[];
+}
+
+export async function claimGhlPendingAppInstall(id: string): Promise<GhlPendingAppInstallRecord | null> {
+  const supabase = getSupabase();
+  const now = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("ghl_pending_app_installs")
+    .update({ status: "processing", processing_started_at: now, error_code: null, updated_at: now })
+    .eq("id", id)
+    .in("status", ["pending", "failed"])
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  if (data) {
+    return data as GhlPendingAppInstallRecord;
+  }
+
+  const staleBefore = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  const { data: staleData, error: staleError } = await supabase
+    .from("ghl_pending_app_installs")
+    .update({ status: "processing", processing_started_at: now, error_code: null, updated_at: now })
+    .eq("id", id)
+    .eq("status", "processing")
+    .lt("processing_started_at", staleBefore)
+    .select("*")
+    .maybeSingle();
+
+  if (staleError) {
+    throw new Error(staleError.message);
+  }
+
+  return staleData as GhlPendingAppInstallRecord | null;
+}
+
+export async function completeGhlPendingAppInstall(input: {
+  id: string;
+  sessionId?: string;
+}): Promise<void> {
+  const now = new Date().toISOString();
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from("ghl_pending_app_installs")
+    .update({
+      status: "completed",
+      processing_started_at: null,
+      completed_at: now,
+      completed_session_id: input.sessionId ?? null,
+      error_code: null,
+      updated_at: now
+    })
+    .eq("id", input.id);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+export async function failGhlPendingAppInstall(id: string, errorCode: string): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from("ghl_pending_app_installs")
+    .update({
+      status: "failed",
+      processing_started_at: null,
+      error_code: errorCode,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", id);
+
+  if (error) {
+    throw new Error(error.message);
+  }
 }
 
 export async function saveWebhookEvent(input: SaveWebhookEventInput): Promise<WebhookEventRecord> {

@@ -18,7 +18,8 @@ function getOAuthFailureStatus(error: GhlOAuthError): number {
   if (
     error.publicErrorCode === "oauth_missing_location_id" ||
     error.publicErrorCode === "oauth_missing_company_id" ||
-    error.publicErrorCode === "oauth_missing_installed_locations"
+    error.publicErrorCode === "oauth_missing_installed_locations" ||
+    error.publicErrorCode === "oauth_app_id_mismatch"
   ) {
     return 400;
   }
