@@ -1,4 +1,3 @@
-import { env } from "../config/env";
 import { logger } from "../config/logger";
 import { sendInboundMessageToGhl } from "../integrations/ghlInboundMessageClient";
 import {
@@ -10,7 +9,7 @@ import {
 import { getLineProfile } from "../integrations/lineClient";
 import type { LineMessage, LineProfile, LineSource, LineWebhookEvent } from "../types/line";
 import { getErrorMessage, serializeError } from "../utils/errors";
-import { redactSecrets } from "../utils/redaction";
+import { redactSecrets, redactSensitiveText } from "../utils/redaction";
 import {
   clearGhlMapping,
   ensureDefaultTenant,
@@ -30,12 +29,10 @@ export type LineInboundProcessingContext = {
   channelAccessToken?: string;
 };
 
-type TenantGhlConfigSource = "tenant" | "env_fallback";
-
 type ResolvedTenantGhlConfig = {
-  locationId?: string;
-  providerId?: string;
-  configSource: TenantGhlConfigSource;
+  locationId: string;
+  providerId: string;
+  configSource: "tenant";
 };
 
 function getTrimmedValue(value: string | null | undefined): string | undefined {
@@ -43,38 +40,30 @@ function getTrimmedValue(value: string | null | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function getEnvGhlConfig(): ResolvedTenantGhlConfig {
-  return {
-    locationId: getTrimmedValue(env.GHL_LOCATION_ID),
-    providerId: getTrimmedValue(env.GHL_CUSTOM_PROVIDER_ID),
-    configSource: "env_fallback"
-  };
-}
-
 async function resolveTenantGhlConfig(tenantId: string): Promise<ResolvedTenantGhlConfig> {
-  try {
-    const tenant = await getTenantById(tenantId);
-    const locationId = getTrimmedValue(tenant?.location_id);
-    const providerId = getTrimmedValue(tenant?.ghl_provider_id);
+  const tenant = await getTenantById(tenantId);
 
-    if (locationId && providerId) {
-      return {
-        locationId,
-        providerId,
-        configSource: "tenant"
-      };
-    }
-  } catch (error) {
-    logger.warn(
-      {
-        tenantId,
-        error: redactSecrets(serializeError(error))
-      },
-      "Failed to load tenant GHL config for LINE inbound; falling back to env config"
-    );
+  if (!tenant) {
+    throw new Error(`Tenant ${tenantId} was not found`);
   }
 
-  return getEnvGhlConfig();
+  const locationId = getTrimmedValue(tenant.location_id);
+
+  if (!locationId) {
+    throw new Error(`Tenant ${tenantId} has no location_id`);
+  }
+
+  const providerId = getTrimmedValue(tenant.ghl_provider_id);
+
+  if (!providerId) {
+    throw new Error(`Tenant ${tenantId} has no ghl_provider_id`);
+  }
+
+  return {
+    locationId,
+    providerId,
+    configSource: "tenant"
+  };
 }
 
 function getLineUserId(source: LineSource): string | undefined {
@@ -118,6 +107,66 @@ function getWebhookEventId(event: LineWebhookEvent): string | undefined {
 function appendMessage(parts: string[], message: string | undefined): string | undefined {
   const cleanParts = [...parts, message].filter((part): part is string => Boolean(part?.trim()));
   return cleanParts.length > 0 ? cleanParts.join("; ") : undefined;
+}
+
+async function recordTenantGhlConfigFailure(input: {
+  tenantId: string;
+  event: LineWebhookEvent;
+  lineUserId?: string;
+  lineMessageId?: string;
+  webhookKey?: string;
+  error: unknown;
+}): Promise<string> {
+  const errorMessage = redactSensitiveText(getErrorMessage(input.error));
+  const reason = `Tenant GHL configuration resolution failed: ${errorMessage}`;
+  const requestPayload = {
+    source: "tenant_ghl_config_resolution",
+    tenantId: input.tenantId,
+    webhookKey: input.webhookKey,
+    configSource: "tenant",
+    messageEventStatus: "failed"
+  };
+
+  try {
+    await saveMessageEvent({
+      tenantId: input.tenantId,
+      provider: "line",
+      direction: "inbound",
+      externalMessageId: input.lineMessageId ?? input.event.webhookEventId,
+      lineUserId: input.lineUserId,
+      payload: input.event,
+      status: "failed",
+      errorMessage: reason,
+      requestPayload
+    });
+  } catch (persistenceError) {
+    logger.error(
+      {
+        tenantId: input.tenantId,
+        webhookKey: input.webhookKey,
+        lineUserId: input.lineUserId,
+        lineMessageId: input.lineMessageId,
+        persistenceError: redactSensitiveText(getErrorMessage(persistenceError)),
+        messageEventStatus: "failed"
+      },
+      "Failed to persist LINE inbound tenant configuration failure"
+    );
+  }
+
+  logger.error(
+    {
+      tenantId: input.tenantId,
+      webhookKey: input.webhookKey,
+      lineUserId: input.lineUserId,
+      lineMessageId: input.lineMessageId,
+      error: errorMessage,
+      configSource: "tenant",
+      messageEventStatus: "failed"
+    },
+    "Blocked LINE inbound processing because tenant GHL configuration could not be resolved"
+  );
+
+  return reason;
 }
 
 function mergeRequestPayloadWithAuthDiagnostics(requestPayload: unknown): unknown {
@@ -258,7 +307,21 @@ export async function processLineWebhookEvent(event: LineWebhookEvent, context: 
 
   try {
     const tenantId = context.tenantId ?? (await ensureDefaultTenant());
-    const ghlConfig = await resolveTenantGhlConfig(tenantId);
+    let ghlConfig: ResolvedTenantGhlConfig;
+
+    try {
+      ghlConfig = await resolveTenantGhlConfig(tenantId);
+    } catch (error) {
+      const reason = await recordTenantGhlConfigFailure({
+        tenantId,
+        event,
+        lineUserId,
+        lineMessageId,
+        webhookKey: context.webhookKey,
+        error
+      });
+      return { status: "failed", reason };
+    }
 
     logger.info(
       {

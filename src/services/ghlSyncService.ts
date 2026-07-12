@@ -7,7 +7,6 @@ import {
   resolveLineChannelForOutbound
 } from "./lineOutboundChannelService";
 import {
-  ensureDefaultTenant,
   findLineProfileByGhlIdsForTenantIds,
   findWorkflowOutboundMirrorMessageEventForTenantIds,
   getTenantIdsByLocationId,
@@ -94,10 +93,10 @@ async function resolveTenantIdsForGhlOutboundWebhook(message: NormalizedGhlOutbo
       conversationId: message.conversationId,
       ghlMessageId: message.messageId
     },
-    "HighLevel outbound provider webhook payload did not include locationId; falling back to default tenant is not multi-OA safe"
+    "Skipped HighLevel outbound provider webhook because payload locationId is missing"
   );
 
-  return [await ensureDefaultTenant()];
+  return [];
 }
 
 export async function processGhlOutboundWebhook(payload: Record<string, unknown>): Promise<{
@@ -108,7 +107,10 @@ export async function processGhlOutboundWebhook(payload: Record<string, unknown>
   const tenantIds = await resolveTenantIdsForGhlOutboundWebhook(message);
 
   if (tenantIds.length === 0) {
-    return { status: "skipped", reason: "No tenant found for locationId" };
+    return {
+      status: "skipped",
+      reason: message.locationId ? "No tenant found for locationId" : "Missing locationId"
+    };
   }
 
   logger.info(
