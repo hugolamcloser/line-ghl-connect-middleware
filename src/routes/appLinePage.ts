@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import express from "express";
 import type { Request, Response } from "express";
 import { Router } from "express";
+import QRCode from "qrcode";
 import { z } from "zod";
 import { env } from "../config/env";
 import { HttpError } from "../middleware/errors";
@@ -22,6 +23,11 @@ type SignedPagePayload = {
   locationId: string;
   expiresAt: number;
   nonce: string;
+};
+
+type LineTestChatDetails = {
+  lineChatUrl: string;
+  qrCodeDataUrl: string;
 };
 
 const tokenTtlMs = 15 * 60 * 1000;
@@ -207,6 +213,9 @@ async function renderLinePage(
     publicBaseUrl: getPublicBaseUrl(req)
   });
   const avatarDataUrl = await getLineBotAvatarDataUrl(settings.line_bot_info?.pictureUrl);
+  const lineChatUrl = buildLineChatUrl(settings.line_bot_info?.basicId);
+  const qrCodeDataUrl = await getLineChatQrCodeDataUrl(lineChatUrl);
+  const lineTestChat = lineChatUrl && qrCodeDataUrl ? { lineChatUrl, qrCodeDataUrl } : null;
   const scriptNonce = crypto.randomBytes(16).toString("base64url");
 
   setPageHeaders(res, scriptNonce);
@@ -215,6 +224,7 @@ async function renderLinePage(
       ...input,
       settings,
       avatarDataUrl,
+      lineTestChat,
       scriptNonce,
       connectActionToken: createSignedToken({
         kind: "page_action",
@@ -235,6 +245,7 @@ function buildLinePageHtml(input: {
   pageToken: string;
   settings: LineConnectionSettings;
   avatarDataUrl: string | null;
+  lineTestChat: LineTestChatDetails | null;
   connectActionToken: string;
   disconnectActionToken: string;
   scriptNonce: string;
@@ -258,7 +269,7 @@ function buildLinePageHtml(input: {
 <title>LINE Official Account</title>
 <style>
 :root{--bg:#f6f7f9;--panel:#fff;--border:#dfe3ea;--text:#162033;--muted:#667085;--line:#06c755;--line-dark:#049746;--danger:#ba1a1a;--danger-bg:#fff1f0;--ok:#edfdf4;--ok-border:#abefc6;--warn:#fffaeb;--warn-border:#fedf89}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(920px,calc(100vw - 32px));margin:0 auto;padding:28px 0}.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}h1,h2,h3,p{margin:0}h1{font-size:28px;line-height:1.15}h2{font-size:18px;margin-bottom:12px}h3{font-size:15px;margin-bottom:8px}.tenant,.help,.small{color:var(--muted);font-size:13px}.tenant{margin-top:6px;word-break:break-all}.pill{border:1px solid var(--border);border-radius:999px;padding:9px 16px;background:#fff;font-size:15px;font-weight:800;white-space:nowrap}.pill.connected{color:#067647;border-color:var(--ok-border);background:var(--ok)}.pill.disconnected{color:#7a4b00;border-color:var(--warn-border);background:var(--warn)}.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:22px;margin-bottom:16px;box-shadow:0 12px 30px rgba(21,28,43,.08)}.success{border-color:var(--ok-border);background:linear-gradient(180deg,#f6fef9,#fff)}.account{display:flex;align-items:center;gap:14px;margin-top:16px;padding:16px;border:1px solid var(--border);border-radius:8px;background:#fff}.account-details{min-width:0;flex:1}.avatar{width:48px;height:48px;border-radius:12px;object-fit:cover;border:1px solid var(--border);background:var(--line)}.avatar-fallback{display:grid;place-items:center;color:#fff;font-weight:900;font-size:20px}.account-name{font-size:20px;font-weight:800;word-break:break-word}.account-sub{color:var(--muted);font-size:13px;margin-top:2px}.field{margin-bottom:14px}label{display:block;color:#344054;font-weight:700;font-size:13px;margin-bottom:6px}input,textarea{width:100%;border:1px solid var(--border);border-radius:8px;padding:11px 12px;font:inherit;color:var(--text);background:#fff}textarea{min-height:120px;resize:vertical}input[readonly]{background:#f9fafb}.inline{display:flex;gap:10px}.inline input{min-width:0}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}button{border:0;border-radius:8px;padding:10px 14px;min-height:42px;font:inherit;font-weight:700;cursor:pointer}.primary{background:var(--line);color:#fff}.primary:hover{background:var(--line-dark)}.secondary{background:#eef2f6;color:var(--text)}.danger{background:var(--danger);color:#fff}button:disabled{cursor:not-allowed;opacity:.55}.notice,.error{border-radius:8px;padding:12px 14px;margin-bottom:16px}.notice{border:1px solid var(--ok-border);background:var(--ok);color:#05603a}.error{border:1px solid #fecdca;background:var(--danger-bg);color:var(--danger)}.intro{font-size:16px;margin-bottom:16px}.steps,.checks{margin:0;padding-left:22px}.steps li,.checks li{margin:8px 0}.admin-note{margin-bottom:16px}.spaced{margin-top:14px}@media(max-width:720px){main{width:min(100vw - 24px,920px);padding:20px 0}.topbar{flex-direction:column}.inline{flex-direction:column}.account{align-items:flex-start;flex-wrap:wrap}.pill{font-size:14px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body.modal-open{overflow:hidden}main{width:min(920px,calc(100vw - 32px));margin:0 auto;padding:28px 0}[hidden]{display:none!important}.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}h1,h2,h3,p{margin:0}h1{font-size:28px;line-height:1.15}h2{font-size:18px;margin-bottom:12px}h3{font-size:15px;margin-bottom:8px}.tenant,.help,.small{color:var(--muted);font-size:13px}.tenant{margin-top:6px;word-break:break-all}.pill{border:1px solid var(--border);border-radius:999px;padding:9px 16px;background:#fff;font-size:15px;font-weight:800;white-space:nowrap}.pill.connected{color:#067647;border-color:var(--ok-border);background:var(--ok)}.pill.disconnected{color:#7a4b00;border-color:var(--warn-border);background:var(--warn)}.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:22px;margin-bottom:16px;box-shadow:0 12px 30px rgba(21,28,43,.08)}.success{border-color:var(--ok-border);background:linear-gradient(180deg,#f6fef9,#fff)}.account{display:flex;align-items:center;gap:14px;margin-top:16px;padding:16px;border:1px solid var(--border);border-radius:8px;background:#fff}.account-details{min-width:0;flex:1}.account-actions{display:flex;flex:0 0 auto;margin-left:auto}.avatar{width:48px;height:48px;border-radius:12px;object-fit:cover;border:1px solid var(--border);background:var(--line)}.avatar-fallback{display:grid;place-items:center;color:#fff;font-weight:900;font-size:20px}.account-name{font-size:20px;font-weight:800;word-break:break-word}.account-sub{color:var(--muted);font-size:13px;margin-top:2px}.field{margin-bottom:14px}label{display:block;color:#344054;font-weight:700;font-size:13px;margin-bottom:6px}input,textarea{width:100%;border:1px solid var(--border);border-radius:8px;padding:11px 12px;font:inherit;color:var(--text);background:#fff}textarea{min-height:120px;resize:vertical}input[readonly]{background:#f9fafb}.inline{display:flex;gap:10px}.inline input{min-width:0}.actions,.modal-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.modal-actions{justify-content:center;margin-top:18px}button,.button-like{border:0;border-radius:8px;padding:10px 14px;min-height:42px;font:inherit;font-weight:700;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}.primary{background:var(--line);color:#fff}.primary:hover{background:var(--line-dark)}.secondary{background:#eef2f6;color:var(--text)}.danger{background:var(--danger);color:#fff}button:disabled{cursor:not-allowed;opacity:.55}.notice,.error{border-radius:8px;padding:12px 14px;margin-bottom:16px}.notice{border:1px solid var(--ok-border);background:var(--ok);color:#05603a}.error{border:1px solid #fecdca;background:var(--danger-bg);color:var(--danger)}.intro{font-size:16px;margin-bottom:16px}.steps,.checks{margin:0;padding-left:22px}.steps li,.checks li{margin:8px 0}.admin-note{margin-bottom:16px}.spaced{margin-top:14px}.modal-backdrop{position:fixed;inset:0;z-index:20;display:grid;place-items:center;padding:24px;background:rgba(16,24,40,.6)}.modal{position:relative;width:min(460px,100%);border:1px solid var(--border);border-radius:8px;background:#fff;padding:24px;text-align:center;box-shadow:0 24px 60px rgba(21,28,43,.28)}.modal h2{font-size:22px;margin:0 42px 8px}.modal-close{position:absolute;right:14px;top:14px;width:36px;min-height:36px;padding:0;font-size:24px;line-height:1}.qr-code{display:block;width:min(300px,100%);height:auto;margin:18px auto 14px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fff}.chat-link-display{display:block;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:#f9fafb;color:var(--text);font-size:13px;font-weight:700;text-decoration:none;word-break:break-all}@media(max-width:720px){main{width:min(100vw - 24px,920px);padding:20px 0}.topbar{flex-direction:column}.inline{flex-direction:column}.account{align-items:flex-start;flex-wrap:wrap}.account-actions{width:100%;margin-left:0}.test-chat-button,.modal-actions>*{width:100%}.pill{font-size:14px}.modal{padding:22px 18px}.modal-actions{flex-direction:column}}
 </style>
 </head>
 <body>
@@ -275,9 +286,54 @@ function buildLinePageHtml(input: {
 const copyButton=document.getElementById("copy-webhook");
 const webhookInput=document.getElementById("webhook-url");
 copyButton?.addEventListener("click",async()=>{if(!webhookInput?.value)return;try{await navigator.clipboard.writeText(webhookInput.value)}catch{webhookInput.select();document.execCommand("copy")}copyButton.textContent="Copied";window.setTimeout(()=>{copyButton.textContent="Copy"},1500)});
+const testChatModal=document.getElementById("test-chat-modal");
+const openTestChatButton=document.getElementById("open-test-chat");
+const closeTestChatButton=document.getElementById("close-test-chat");
+const copyChatLinkButton=document.getElementById("copy-chat-link");
+const lineChatUrl=copyChatLinkButton?.getAttribute("data-chat-link")||"";
+function setTestChatModalOpen(isOpen){if(!testChatModal)return;testChatModal.hidden=!isOpen;document.body.classList.toggle("modal-open",isOpen);if(isOpen){closeTestChatButton?.focus()}else{openTestChatButton?.focus()}}
+openTestChatButton?.addEventListener("click",()=>setTestChatModalOpen(true));
+closeTestChatButton?.addEventListener("click",()=>setTestChatModalOpen(false));
+testChatModal?.addEventListener("click",(event)=>{if(event.target===testChatModal)setTestChatModalOpen(false)});
+document.addEventListener("keydown",(event)=>{if(event.key==="Escape"&&testChatModal&&!testChatModal.hidden)setTestChatModalOpen(false)});
+copyChatLinkButton?.addEventListener("click",async()=>{if(!lineChatUrl)return;try{await navigator.clipboard.writeText(lineChatUrl)}catch{const textArea=document.createElement("textarea");textArea.value=lineChatUrl;textArea.style.position="fixed";textArea.style.left="-9999px";document.body.appendChild(textArea);textArea.focus();textArea.select();document.execCommand("copy");textArea.remove()}copyChatLinkButton.textContent="Copied";window.setTimeout(()=>{copyChatLinkButton.textContent="Copy link"},1500)});
 </script>
 </body>
 </html>`;
+}
+
+function buildLineChatUrl(basicId: string | null | undefined): string | null {
+  const trimmedBasicId = basicId?.trim();
+
+  if (!trimmedBasicId) {
+    return null;
+  }
+
+  const safeBasicId = /^[A-Za-z0-9@._-]+$/.test(trimmedBasicId)
+    ? trimmedBasicId
+    : encodeURIComponent(trimmedBasicId);
+
+  return `https://line.me/R/ti/p/${safeBasicId}`;
+}
+
+async function getLineChatQrCodeDataUrl(lineChatUrl: string | null): Promise<string | null> {
+  if (!lineChatUrl) {
+    return null;
+  }
+
+  try {
+    return await QRCode.toDataURL(lineChatUrl, {
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 320,
+      color: {
+        dark: "#162033",
+        light: "#ffffff"
+      }
+    });
+  } catch {
+    return null;
+  }
 }
 
 function getSafeHttpUrl(value: string | null | undefined): string | null {
@@ -357,8 +413,10 @@ function buildConnectedView(input: {
   accountName: string;
   basicId?: string | null;
   avatarDataUrl: string | null;
+  lineTestChat: LineTestChatDetails | null;
 }): string {
   return `${buildConnectedAccountPanel(input)}
+  ${input.lineTestChat ? buildTestChatModal(input.lineTestChat) : ""}
   ${buildWebhookPanel(input.webhookUrl)}
   ${buildDisconnectPanel(input)}`;
 }
@@ -367,11 +425,15 @@ function buildConnectedAccountPanel(input: {
   accountName: string;
   basicId?: string | null;
   avatarDataUrl: string | null;
+  lineTestChat: LineTestChatDetails | null;
 }): string {
   const avatar = input.avatarDataUrl
     ? `<img class="avatar" src="${escapeHtml(input.avatarDataUrl)}" alt="">`
     : `<div class="avatar avatar-fallback" aria-hidden="true">L</div>`;
   const basicId = input.basicId ? `<div class="account-sub">${escapeHtml(input.basicId)}</div>` : "";
+  const testChatButton = input.lineTestChat
+    ? `<div class="account-actions"><button class="secondary test-chat-button" type="button" id="open-test-chat">Test Chat</button></div>`
+    : "";
 
   return `<section class="panel success">
     <h2>Active</h2>
@@ -383,8 +445,34 @@ function buildConnectedAccountPanel(input: {
         <div class="account-name">${escapeHtml(input.accountName)}</div>
         ${basicId}
       </div>
+      ${testChatButton}
     </div>
   </section>`;
+}
+
+function buildTestChatModal(input: LineTestChatDetails): string {
+  return `<div class="modal-backdrop" id="test-chat-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="test-chat-title">
+      <button class="secondary modal-close" type="button" id="close-test-chat" aria-label="Close">&times;</button>
+      <h2 id="test-chat-title">LINE QR Code</h2>
+      <p class="help">Scan this QR code to start a conversation.</p>
+      <img class="qr-code" src="${escapeHtml(input.qrCodeDataUrl)}" alt="LINE chat QR code">
+      <a class="chat-link-display" href="${escapeHtml(input.lineChatUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(
+        input.lineChatUrl
+      )}</a>
+      <div class="modal-actions">
+        <button class="secondary" type="button" id="copy-chat-link" data-chat-link="${escapeHtml(
+          input.lineChatUrl
+        )}">Copy link</button>
+        <a class="button-like secondary" href="${escapeHtml(
+          input.qrCodeDataUrl
+        )}" download="line-qr-code.png">Download QR Code</a>
+        <a class="button-like primary" href="${escapeHtml(
+          input.lineChatUrl
+        )}" target="_blank" rel="noopener noreferrer">Chat on LINE</a>
+      </div>
+    </div>
+  </div>`;
 }
 
 function buildDisconnectPanel(input: {
