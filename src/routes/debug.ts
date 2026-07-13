@@ -39,6 +39,8 @@ const requireSharedSecretInProduction: RequestHandler = (req, res, next) => {
   requireSharedSecret(req, res, next);
 };
 
+debugRouter.use(requireSharedSecretInProduction);
+
 debugRouter.get("/debug/env-check", (_req, res) => {
   res.json({
     ok: true,
@@ -195,7 +197,7 @@ debugRouter.get("/debug/ghl-conversation-permission-test", async (_req, res, nex
   }
 });
 
-debugRouter.get("/debug/ghl-inbound-payload-matrix", requireSharedSecretInProduction, async (_req, res, next) => {
+debugRouter.get("/debug/ghl-inbound-payload-matrix", async (_req, res, next) => {
   try {
     res.json({
       ok: true,
@@ -206,7 +208,7 @@ debugRouter.get("/debug/ghl-inbound-payload-matrix", requireSharedSecretInProduc
   }
 });
 
-debugRouter.get("/debug/ghl-token-install-summary", requireSharedSecretInProduction, async (_req, res, next) => {
+debugRouter.get("/debug/ghl-token-install-summary", async (_req, res, next) => {
   try {
     res.json({
       ok: true,
