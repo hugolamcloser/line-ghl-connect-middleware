@@ -39,7 +39,7 @@ const requireSharedSecretInProduction: RequestHandler = (req, res, next) => {
   requireSharedSecret(req, res, next);
 };
 
-debugRouter.use(requireSharedSecretInProduction);
+debugRouter.use("/debug", requireSharedSecretInProduction);
 
 debugRouter.get("/debug/env-check", (_req, res) => {
   res.json({
