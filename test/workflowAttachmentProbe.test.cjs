@@ -111,12 +111,30 @@ function protectedPayload(overrides = {}) {
 
 function assertCommonPresence(body) {
   assert.match(body.requestId, /^\d+$/);
+  assert.equal(body.payloadValueType, "object");
+  assert.deepEqual(body.payloadTopLevelKeys, ["data", "extras", "meta"]);
+  assert.deepEqual(body.payloadTopLevelValueTypes, ["object", "object", "object"]);
   assert.equal(body.locationIdPresent, true);
+  assert.equal(body.locationIdKeyFound, true);
+  assert.equal(body.locationIdFieldPath, "$.extras.locationId");
+  assert.equal(body.locationIdValueType, "string");
   assert.equal(body.contactIdPresent, true);
+  assert.equal(body.contactIdKeyFound, true);
+  assert.equal(body.contactIdFieldPath, "$.extras.contactId");
+  assert.equal(body.contactIdValueType, "string");
   assert.equal(body.workflowIdPresent, true);
+  assert.equal(body.workflowIdKeyFound, true);
+  assert.equal(body.workflowIdFieldPath, "$.extras.workflowId");
+  assert.equal(body.workflowIdValueType, "string");
   assert.equal(body.imageAttachmentProbePresent, true);
+  assert.equal(body.imageAttachmentProbeKeyFound, true);
+  assert.equal(body.imageAttachmentProbeFieldPath, "$.data.imageAttachmentProbe");
   assert.equal(body.imageUrlProbePresent, true);
+  assert.equal(body.imageUrlProbeKeyFound, true);
+  assert.equal(body.imageUrlProbeFieldPath, "$.data.imageUrlProbe");
+  assert.equal(body.imageUrlProbeValueType, "string");
   assert.equal(body.imageUrlProbeHttps, true);
+  assert.equal(body.imageUrlProbeHostname, "images.example.com");
 }
 
 test("production probe rejects missing and invalid x-wincrm-webhook-secret headers", async () => {
@@ -189,6 +207,142 @@ test("protected probe accepts payload metadata without calling external or persi
   assert.equal(response.body.attachmentStringLooksLikeJson, false);
   assert.equal(response.body.attachmentStringDecodedType, null);
   assert.equal(response.body.httpsUrlFieldPath, "$");
+});
+
+test("probe discovers all expected fields at the payload top level", async () => {
+  config.env.NODE_ENV = "production";
+  config.env.WEBHOOK_SHARED_SECRET = "probe-shared-secret";
+  const imageUrl = "https://top-level-images.example.com/private/top-level.png?signature=top-level-secret";
+  const response = await requestApp({
+    body: {
+      locationId: "top_level_location",
+      contactId: "top_level_contact",
+      workflowId: "top_level_workflow",
+      imageAttachmentProbe: "https://top-level-attachment.example.com/private/attachment.png",
+      imageUrlProbe: imageUrl
+    },
+    secret: "probe-shared-secret"
+  });
+  const responseText = JSON.stringify(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body.payloadTopLevelKeys, [
+    "locationId",
+    "contactId",
+    "workflowId",
+    "imageAttachmentProbe",
+    "imageUrlProbe"
+  ]);
+  assert.deepEqual(response.body.payloadTopLevelValueTypes, ["string", "string", "string", "string", "string"]);
+  assert.equal(response.body.locationIdFieldPath, "$.locationId");
+  assert.equal(response.body.contactIdFieldPath, "$.contactId");
+  assert.equal(response.body.workflowIdFieldPath, "$.workflowId");
+  assert.equal(response.body.imageAttachmentProbeFieldPath, "$.imageAttachmentProbe");
+  assert.equal(response.body.imageUrlProbeFieldPath, "$.imageUrlProbe");
+  assert.equal(response.body.imageUrlProbeHttps, true);
+  assert.equal(response.body.imageUrlProbeHostname, "top-level-images.example.com");
+  assert.equal(responseText.includes(imageUrl), false);
+  assert.equal(responseText.includes("top-level-secret"), false);
+});
+
+test("probe discovers expected fields inside a different nested wrapper", async () => {
+  config.env.NODE_ENV = "production";
+  config.env.WEBHOOK_SHARED_SECRET = "probe-shared-secret";
+  const unsafeWrapperName = "request-envelope[0].json";
+  const imageUrl = "https://nested-images.example.com/private/nested.png?signature=nested-url-secret";
+  const response = await requestApp({
+    body: {
+      [unsafeWrapperName]: {
+        actionInput: {
+          locationId: "nested_location",
+          contactId: "nested_contact",
+          workflowId: "nested_workflow",
+          imageUrlProbe: imageUrl
+        }
+      }
+    },
+    secret: "probe-shared-secret"
+  });
+  const responseText = JSON.stringify(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body.payloadTopLevelKeys, ["field_0"]);
+  assert.equal(response.body.locationIdFieldPath, "$.field_0.actionInput.locationId");
+  assert.equal(response.body.contactIdFieldPath, "$.field_0.actionInput.contactId");
+  assert.equal(response.body.workflowIdFieldPath, "$.field_0.actionInput.workflowId");
+  assert.equal(response.body.imageUrlProbeFieldPath, "$.field_0.actionInput.imageUrlProbe");
+  assert.equal(response.body.imageUrlProbeValueType, "string");
+  assert.equal(response.body.imageUrlProbePresent, true);
+  assert.equal(response.body.imageUrlProbeHttps, true);
+  assert.equal(response.body.imageUrlProbeHostname, "nested-images.example.com");
+  assert.equal(response.body.imageAttachmentProbeKeyFound, false);
+  assert.equal(response.body.imageAttachmentProbeFieldPath, null);
+  assert.equal(responseText.includes(imageUrl), false);
+  assert.equal(responseText.includes("nested-url-secret"), false);
+  assert.equal(responseText.includes(unsafeWrapperName), false);
+});
+
+test("probe discovers an attachment object outside the canonical data wrapper", async () => {
+  config.env.NODE_ENV = "production";
+  config.env.WEBHOOK_SHARED_SECRET = "probe-shared-secret";
+  const filename = "outside-data-object.png";
+  const attachmentUrl = "https://outside-object.example.com/private/object.png?signature=outside-object-secret";
+  const response = await requestApp({
+    body: {
+      alternate: {
+        imageAttachmentProbe: {
+          filename,
+          file: { url: attachmentUrl }
+        }
+      }
+    },
+    secret: "probe-shared-secret"
+  });
+  const responseText = JSON.stringify(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.imageAttachmentProbeKeyFound, true);
+  assert.equal(response.body.imageAttachmentProbePresent, true);
+  assert.equal(response.body.imageAttachmentProbeFieldPath, "$.alternate.imageAttachmentProbe");
+  assert.equal(response.body.imageAttachmentProbeValueType, "object");
+  assert.equal(response.body.httpsUrlDetected, true);
+  assert.equal(response.body.httpsUrlFieldPath, "$.file.url");
+  assert.equal(response.body.urlHostname, "outside-object.example.com");
+  assert.equal(response.body.urlHasQueryParameters, true);
+  for (const sensitiveValue of [filename, attachmentUrl, "outside-object-secret", "private/object.png"]) {
+    assert.equal(responseText.includes(sensitiveValue), false);
+  }
+});
+
+test("probe discovers an attachment array outside the canonical data wrapper", async () => {
+  config.env.NODE_ENV = "production";
+  config.env.WEBHOOK_SHARED_SECRET = "probe-shared-secret";
+  const filename = "outside-data-array.png";
+  const attachmentUrl = "https://outside-array.example.com/private/array.png?signature=outside-array-secret";
+  const response = await requestApp({
+    body: {
+      envelope: [
+        {
+          fields: {
+            imageAttachmentProbe: [{ filename, url: attachmentUrl }]
+          }
+        }
+      ]
+    },
+    secret: "probe-shared-secret"
+  });
+  const responseText = JSON.stringify(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.imageAttachmentProbeKeyFound, true);
+  assert.equal(response.body.imageAttachmentProbeFieldPath, "$.envelope[0].fields.imageAttachmentProbe");
+  assert.equal(response.body.imageAttachmentProbeValueType, "array");
+  assert.deepEqual(response.body.attachmentArrayElementTypes, ["object"]);
+  assert.equal(response.body.httpsUrlFieldPath, "$[0].url");
+  assert.equal(response.body.urlHostname, "outside-array.example.com");
+  for (const sensitiveValue of [filename, attachmentUrl, "outside-array-secret", "private/array.png"]) {
+    assert.equal(responseText.includes(sensitiveValue), false);
+  }
 });
 
 test("probe classifies a string attachment and returns only its safe URL metadata", async () => {
@@ -372,8 +526,43 @@ test("probe caps returned keys, array inspection, traversal depth, and total ins
       )
     ])
   );
+  const largePayload = Object.fromEntries(
+    Array.from({ length: 25 }, (_, index) => [`payloadKey_${index}`, `payloadValue_${index}`])
+  );
+  let deepPayload = { locationId: "too_deep_location" };
+  for (let index = 0; index < 8; index += 1) {
+    deepPayload = { wrapper: deepPayload };
+  }
+  const arrayLimitedPayload = {
+    wrapper: [
+      ...Array.from({ length: 10 }, (_, index) => ({ ignored: `value_${index}` })),
+      { imageUrlProbe: "https://array-body-limit.example.com/private/uninspected.png" }
+    ]
+  };
+  const nodeLimitedPayload = Object.fromEntries(
+    Array.from({ length: 20 }, (_, outerIndex) => [
+      `branch_${outerIndex}`,
+      Object.fromEntries(
+        Array.from({ length: 20 }, (_, innerIndex) => [
+          `leaf_${innerIndex}`,
+          outerIndex === 19 && innerIndex === 19
+            ? { locationId: "node_limited_location" }
+            : { ignored: `opaque_${outerIndex}_${innerIndex}` }
+        ])
+      )
+    ])
+  );
 
-  const [keysResponse, arrayResponse, depthResponse, nodesResponse] = await Promise.all([
+  const [
+    keysResponse,
+    arrayResponse,
+    depthResponse,
+    nodesResponse,
+    payloadKeysResponse,
+    payloadArrayResponse,
+    payloadDepthResponse,
+    payloadNodesResponse
+  ] = await Promise.all([
     requestApp({
       body: protectedPayload({ imageAttachmentProbe: largeObject }),
       secret: "probe-shared-secret"
@@ -394,6 +583,22 @@ test("probe caps returned keys, array inspection, traversal depth, and total ins
     requestApp({
       body: protectedPayload({ imageAttachmentProbe: wideObject }),
       secret: "probe-shared-secret"
+    }),
+    requestApp({
+      body: largePayload,
+      secret: "probe-shared-secret"
+    }),
+    requestApp({
+      body: arrayLimitedPayload,
+      secret: "probe-shared-secret"
+    }),
+    requestApp({
+      body: deepPayload,
+      secret: "probe-shared-secret"
+    }),
+    requestApp({
+      body: nodeLimitedPayload,
+      secret: "probe-shared-secret"
     })
   ]);
 
@@ -406,6 +611,14 @@ test("probe caps returned keys, array inspection, traversal depth, and total ins
   assert.equal(depthResponse.body.httpsUrlFieldPath, null);
   assert.equal(nodesResponse.body.httpsUrlDetected, false);
   assert.equal(nodesResponse.body.httpsUrlFieldPath, null);
+  assert.equal(payloadKeysResponse.body.payloadTopLevelKeys.length, 20);
+  assert.equal(payloadKeysResponse.body.payloadTopLevelKeys.includes("payloadKey_20"), false);
+  assert.equal(payloadArrayResponse.body.imageUrlProbeKeyFound, false);
+  assert.equal(payloadArrayResponse.body.imageUrlProbeFieldPath, null);
+  assert.equal(payloadDepthResponse.body.locationIdKeyFound, false);
+  assert.equal(payloadDepthResponse.body.locationIdFieldPath, null);
+  assert.equal(payloadNodesResponse.body.locationIdKeyFound, false);
+  assert.equal(payloadNodesResponse.body.locationIdFieldPath, null);
 });
 
 test("probe omits full attachment URLs, signed query values, payload secrets, and headers from response and logs", async () => {
