@@ -1,6 +1,7 @@
 import { env, requireEnvValue } from "../config/env";
 import { logger } from "../config/logger";
 import { forceRefreshGhlAuthContext, getGhlAuthContext, type GhlAuthContext } from "../services/ghlOAuthService";
+import { buildMessageLogMetadata, buildShortLogRef, hasLogValue } from "../utils/logPrivacy";
 import { redactSecrets, redactSensitiveText } from "../utils/redaction";
 
 type GhlWorkflowOutboundMirrorPayload = {
@@ -12,6 +13,7 @@ type GhlWorkflowOutboundMirrorPayload = {
 };
 
 export type GhlWorkflowOutboundMirrorInput = {
+  requestId?: string;
   locationId: string;
   contactId: string;
   message: string;
@@ -38,6 +40,22 @@ export type GhlWorkflowOutboundMirrorResult = {
 
 const endpoint = "/conversations/messages";
 const method = "POST";
+
+function buildMirrorLogContext(input: GhlWorkflowOutboundMirrorInput): Record<string, unknown> {
+  return {
+    requestId: input.requestId,
+    selectedMessageType: "text",
+    ...buildMessageLogMetadata(input.message),
+    locationIdPresent: hasLogValue(input.locationId),
+    locationRef: buildShortLogRef(input.locationId),
+    contactIdPresent: hasLogValue(input.contactId),
+    contactRef: buildShortLogRef(input.contactId),
+    workflowIdPresent: hasLogValue(input.workflowId),
+    lineMessageIdPresent: hasLogValue(input.lineMessageId),
+    existingConversationIdPresent: hasLogValue(input.existingGhlConversationId),
+    conversationProviderIdPresent: hasLogValue(input.conversationProviderId)
+  };
+}
 
 function getString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
@@ -226,12 +244,8 @@ export async function mirrorWorkflowOutboundMessageToGhl(
     {
       endpoint,
       method,
-      locationId: input.locationId,
-      contactId: input.contactId,
-      workflowId: input.workflowId,
-      lineMessageId: input.lineMessageId,
-      existingGhlConversationId: input.existingGhlConversationId,
-      requestBody
+      ...buildMirrorLogContext(input),
+      providerDispatchStatus: "preparing"
     },
     "Preparing HighLevel workflow outbound mirror request"
   );
@@ -246,9 +260,8 @@ export async function mirrorWorkflowOutboundMessageToGhl(
           endpoint,
           method,
           authMode: auth.mode,
-          locationId: input.locationId,
-          contactId: input.contactId,
-          workflowId: input.workflowId,
+          ...buildMirrorLogContext(input),
+          providerDispatchStatus: "retrying_auth",
           statusCode: response.status
         },
         "HighLevel workflow outbound mirror returned 401 with OAuth; refreshing token and retrying once"
@@ -266,15 +279,13 @@ export async function mirrorWorkflowOutboundMessageToGhl(
           endpoint,
           method,
           authMode: auth.mode,
-          locationId: input.locationId,
-          contactId: input.contactId,
-          workflowId: input.workflowId,
-          lineMessageId: input.lineMessageId,
-          existingGhlConversationId: input.existingGhlConversationId,
-          ghlConversationId: parsed.ghlConversationId,
+          ...buildMirrorLogContext(input),
+          ghlConversationIdPresent: hasLogValue(parsed.ghlConversationId),
+          ghlMessageIdPresent: false,
           mirrorStatus: "success",
+          providerDispatchStatus: "success",
           statusCode: response.status,
-          responseBody: parsed.responseBody
+          responseBodyPresent: parsed.responseBody !== undefined
         },
         "HighLevel workflow outbound mirror succeeded without a GHL message ID; duplicate-send guard cannot match provider echoes"
       );
@@ -285,17 +296,14 @@ export async function mirrorWorkflowOutboundMessageToGhl(
         endpoint,
         method,
         authMode: auth.mode,
-        locationId: input.locationId,
-        contactId: input.contactId,
-        workflowId: input.workflowId,
-        lineMessageId: input.lineMessageId,
-        existingGhlConversationId: input.existingGhlConversationId,
-        ghlConversationId: parsed.ghlConversationId,
-        ghlMessageId: parsed.ghlMessageId,
+        ...buildMirrorLogContext(input),
+        ghlConversationIdPresent: hasLogValue(parsed.ghlConversationId),
+        ghlMessageIdPresent: hasLogValue(parsed.ghlMessageId),
         mirrorStatus: response.ok ? "success" : "failed",
+        providerDispatchStatus: response.ok ? "success" : "failed",
         statusCode: response.status,
         canonicalCode: parsed.canonicalCode,
-        responseBody: parsed.responseBody
+        responseBodyPresent: parsed.responseBody !== undefined
       },
       "HighLevel workflow outbound mirror request completed"
     );
@@ -323,14 +331,11 @@ export async function mirrorWorkflowOutboundMessageToGhl(
       {
         endpoint,
         method,
-        locationId: input.locationId,
-        contactId: input.contactId,
-        workflowId: input.workflowId,
-        lineMessageId: input.lineMessageId,
-        existingGhlConversationId: input.existingGhlConversationId,
+        ...buildMirrorLogContext(input),
         mirrorStatus: "failed",
-        errorMessage,
-        requestBody
+        providerDispatchStatus: "failed_before_response",
+        errorPresent: true,
+        errorCategory: error instanceof Error ? error.name : "unknown"
       },
       "HighLevel workflow outbound mirror failed before receiving an API response"
     );
