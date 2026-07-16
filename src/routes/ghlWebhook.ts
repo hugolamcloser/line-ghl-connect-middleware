@@ -54,7 +54,9 @@ ghlWebhookRouter.post("/webhooks/ghl/workflows/send-line", async (req, res, next
       return;
     }
 
-    const result = await processGhlWorkflowSendLine(req.body as Record<string, unknown>);
+    const result = await processGhlWorkflowSendLine(req.body as Record<string, unknown>, {
+      requestId: typeof req.id === "string" ? req.id : undefined
+    });
     res.status(result.httpStatus).json(result.body);
   } catch (error) {
     next(error);

@@ -1,13 +1,21 @@
+import crypto from "node:crypto";
 import { logger } from "../config/logger";
 import { env } from "../config/env";
 import {
   mirrorWorkflowOutboundMessageToGhl,
   type GhlWorkflowOutboundMirrorResult
 } from "../integrations/ghlWorkflowOutboundMirrorClient";
-import { pushLineTextMessage } from "../integrations/lineClient";
+import {
+  LineApiError,
+  pushLineImageMessage,
+  pushLineTextMessage,
+  type LineApiErrorCategory,
+  type LinePushMessageResult
+} from "../integrations/lineClient";
 import {
   isLineChannelNotConnectedError,
-  resolveLineChannelForOutbound
+  resolveLineChannelForOutbound,
+  type LineChannelSelection
 } from "./lineOutboundChannelService";
 import {
   findLineProfileByGhlIdsForTenantIds,
@@ -16,6 +24,12 @@ import {
   type LineProfileRecord,
   saveMessageEvent
 } from "./repository";
+import {
+  buildWorkflowLineMessage,
+  WorkflowLineMessageValidationError,
+  type WorkflowLineMessage,
+  type WorkflowLineMessageInputPresence
+} from "./workflowLineMessageBuilder";
 
 type WorkflowSendLineStatus = "sent" | "skipped" | "failed";
 
@@ -32,6 +46,10 @@ export type WorkflowSendLineResult = {
   body: WorkflowSendLineResponse;
 };
 
+export type WorkflowSendLineContext = {
+  requestId?: string;
+};
+
 function getRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -40,6 +58,14 @@ function getRecord(value: unknown): Record<string, unknown> {
 
 function getString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function getWorkflowContextString(
+  payload: Record<string, unknown>,
+  extras: Record<string, unknown>,
+  key: "locationId" | "contactId" | "workflowId"
+): string | undefined {
+  return getString(extras[key]) ?? getString(payload[key]);
 }
 
 function buildResponse(
@@ -72,13 +98,54 @@ function buildExternalMessageId(workflowId: string | undefined, metaKey: string 
   return undefined;
 }
 
+function buildImageAttemptExternalMessageId(requestId: string | undefined): string | undefined {
+  const normalizedRequestId = requestId?.trim();
+
+  if (!normalizedRequestId) {
+    return undefined;
+  }
+
+  const digest = crypto.createHash("sha256").update(normalizedRequestId).digest("hex").slice(0, 32);
+  return `workflow-image-attempt:${digest}`;
+}
+
+function buildImageSuccessExternalMessageId(
+  result: LinePushMessageResult,
+  attemptExternalMessageId: string | undefined
+): string | undefined {
+  if (result.messageId) {
+    return `line:${result.messageId}`;
+  }
+
+  if (result.acceptedByRetryKey && result.acceptedRequestId) {
+    return `line-accepted-request:${result.acceptedRequestId}`;
+  }
+
+  return attemptExternalMessageId;
+}
+
+function getSafeLineErrorMetadata(error: unknown): {
+  statusCode?: number;
+  lineRequestId?: string;
+  category: LineApiErrorCategory | "unknown";
+} {
+  return error instanceof LineApiError
+    ? {
+        statusCode: error.statusCode,
+        lineRequestId: error.lineRequestId,
+        category: error.category
+      }
+    : { category: "unknown" };
+}
+
 function buildWorkflowEventPayload(input: {
   locationId?: string;
   contactId?: string;
   workflowId?: string;
   metaKey?: string;
   metaVersion?: string;
-  messagePresent: boolean;
+  messageType: WorkflowLineMessage["type"];
+  inputPresence: WorkflowLineMessageInputPresence;
 }): Record<string, unknown> {
   return {
     source: "ghl_workflow_action",
@@ -87,8 +154,68 @@ function buildWorkflowEventPayload(input: {
     workflowId: input.workflowId ?? null,
     metaKey: input.metaKey ?? null,
     metaVersion: input.metaVersion ?? null,
-    messagePresent: input.messagePresent
+    messageType: input.messageType,
+    messagePresent: input.inputPresence.messagePresent,
+    originalImageUrlPresent: input.inputPresence.originalImageUrlPresent,
+    previewImageUrlPresent: input.inputPresence.previewImageUrlPresent
   };
+}
+
+function buildSanitizedImageAuditPayload(input: {
+  eventPayload: Record<string, unknown>;
+  originalHostname: string;
+  previewHostname: string;
+}): Record<string, unknown> {
+  return {
+    ...input.eventPayload,
+    originalImageHostname: input.originalHostname,
+    previewImageHostname: input.previewHostname
+  };
+}
+
+async function persistWorkflowImageAudit(input: {
+  requestId?: string;
+  locationId: string;
+  mapping: LineProfileRecord;
+  externalMessageId?: string;
+  payload: Record<string, unknown>;
+  status: "sent" | "failed";
+  errorMessage?: string;
+  requestPayload: Record<string, unknown>;
+  lineResultStatus: "sent" | "failed" | "not_attempted";
+  lineHttpStatusCode?: number;
+}): Promise<"stored" | "failed"> {
+  try {
+    await saveMessageEvent({
+      tenantId: input.mapping.tenant_id,
+      provider: "line",
+      direction: "outbound",
+      externalMessageId: input.externalMessageId,
+      lineUserId: input.mapping.line_user_id,
+      ghlConversationId: input.mapping.ghl_conversation_id ?? undefined,
+      payload: input.payload,
+      status: input.status,
+      errorMessage: input.errorMessage,
+      requestPayload: input.requestPayload
+    });
+
+    return "stored";
+  } catch {
+    logger.error(
+      {
+        requestId: input.requestId,
+        locationId: input.locationId,
+        tenantId: input.mapping.tenant_id,
+        selectedMessageType: "image",
+        lineResultStatus: input.lineResultStatus,
+        lineHttpStatusCode: input.lineHttpStatusCode,
+        auditPersistenceStatus: "failed"
+      },
+      "Failed to persist GHL workflow LINE image audit event"
+    );
+
+    return "failed";
+  }
 }
 
 function stringifyForStorage(value: unknown): string | undefined {
@@ -267,17 +394,39 @@ async function resolveLineProfileByLocationAndGhlContact(
   return { tenantIds, mapping };
 }
 
-export async function processGhlWorkflowSendLine(payload: Record<string, unknown>): Promise<WorkflowSendLineResult> {
-  const data = getRecord(payload.data);
+export async function processGhlWorkflowSendLine(
+  payload: Record<string, unknown>,
+  context: WorkflowSendLineContext = {}
+): Promise<WorkflowSendLineResult> {
   const extras = getRecord(payload.extras);
   const meta = getRecord(payload.meta);
 
-  const message = getString(data.message);
-  const locationId = getString(extras.locationId);
-  const contactId = getString(extras.contactId);
-  const workflowId = getString(extras.workflowId);
+  const locationId = getWorkflowContextString(payload, extras, "locationId");
+  const contactId = getWorkflowContextString(payload, extras, "contactId");
+  const workflowId = getWorkflowContextString(payload, extras, "workflowId");
   const metaKey = getString(meta.key);
   const metaVersion = getString(meta.version);
+  let workflowMessage: WorkflowLineMessage;
+
+  try {
+    workflowMessage = buildWorkflowLineMessage(payload);
+  } catch (error) {
+    if (!(error instanceof WorkflowLineMessageValidationError)) {
+      throw error;
+    }
+
+    logger.warn(
+      {
+        requestId: context.requestId,
+        locationId,
+        selectedMessageType: "invalid",
+        validationStatus: "failed"
+      },
+      "Rejected invalid GHL workflow LINE message"
+    );
+
+    return buildResponse(400, "failed", error.message);
+  }
 
   const eventPayload = buildWorkflowEventPayload({
     locationId,
@@ -285,23 +434,22 @@ export async function processGhlWorkflowSendLine(payload: Record<string, unknown
     workflowId,
     metaKey,
     metaVersion,
-    messagePresent: Boolean(message)
+    messageType: workflowMessage.type,
+    inputPresence: workflowMessage.inputPresence
   });
   const externalMessageId = buildExternalMessageId(workflowId, metaKey);
 
-  if (!message) {
-    logger.warn(
-      {
-        locationId,
-        contactId,
-        workflowId,
-        metaKey
-      },
-      "Skipped GHL workflow LINE send because message is missing"
-    );
-
-    return buildResponse(400, "failed", "Message is required");
-  }
+  logger.info(
+    {
+      requestId: context.requestId,
+      locationId,
+      selectedMessageType: workflowMessage.type,
+      messagePresent: workflowMessage.inputPresence.messagePresent,
+      originalImageUrlPresent: workflowMessage.inputPresence.originalImageUrlPresent,
+      previewImageUrlPresent: workflowMessage.inputPresence.previewImageUrlPresent
+    },
+    "Accepted GHL workflow LINE message input"
+  );
 
   if (!locationId) {
     logger.warn(
@@ -347,6 +495,191 @@ export async function processGhlWorkflowSendLine(payload: Record<string, unknown
     return buildResponse(200, "skipped", "No LINE mapping found for contact");
   }
 
+  if (workflowMessage.type === "image") {
+    const attemptExternalMessageId = buildImageAttemptExternalMessageId(context.requestId);
+    const sanitizedPayload = buildSanitizedImageAuditPayload({
+      eventPayload,
+      originalHostname: workflowMessage.originalHostname,
+      previewHostname: workflowMessage.previewHostname
+    });
+    let lineChannelSelection: LineChannelSelection;
+
+    try {
+      lineChannelSelection = await resolveLineChannelForOutbound(mapping.tenant_id, mapping);
+    } catch (error) {
+      const isDisconnected = isLineChannelNotConnectedError(error);
+      const errorMessage = isDisconnected ? error.message : "LINE image channel resolution failed";
+      const requestPayload = {
+        ...eventPayload,
+        source: "ghl_workflow_image_direct",
+        tenantId: mapping.tenant_id,
+        lineChannelId: isDisconnected
+          ? error.lineChannelId ?? mapping.line_channel_id ?? null
+          : mapping.line_channel_id ?? null,
+        channelTokenSource: isDisconnected ? error.channelTokenSource : null,
+        channelConnected: false,
+        channelResolutionStatus: "failed",
+        lineResultStatus: "not_attempted",
+        lineHttpStatusCode: null,
+        lineErrorCategory: "channel_resolution",
+        mirrorResultStatus: "unsupported"
+      };
+
+      const auditPersistenceStatus = await persistWorkflowImageAudit({
+        requestId: context.requestId,
+        locationId,
+        mapping,
+        externalMessageId: attemptExternalMessageId,
+        payload: sanitizedPayload,
+        status: "failed",
+        errorMessage,
+        requestPayload,
+        lineResultStatus: "not_attempted"
+      });
+
+      const logContext = {
+        requestId: context.requestId,
+        locationId,
+        tenantId: mapping.tenant_id,
+        selectedMessageType: workflowMessage.type,
+        originalImageUrlPresent: workflowMessage.inputPresence.originalImageUrlPresent,
+        previewImageUrlPresent: workflowMessage.inputPresence.previewImageUrlPresent,
+        channelResolutionStatus: "failed",
+        lineResultStatus: "not_attempted",
+        lineHttpStatusCode: null,
+        lineErrorCategory: "channel_resolution",
+        mirrorResultStatus: "unsupported",
+        auditPersistenceStatus,
+        lineChannelId: requestPayload.lineChannelId,
+        channelTokenSource: requestPayload.channelTokenSource,
+        errorMessage
+      };
+
+      if (isDisconnected) {
+        logger.warn(logContext, "Blocked GHL workflow LINE image because LINE channel is not connected");
+        return buildResponse(409, "failed", errorMessage);
+      }
+
+      logger.error(logContext, "Failed to send GHL workflow LINE image");
+      return buildResponse(200, "failed", errorMessage);
+    }
+
+    let lineResult: LinePushMessageResult;
+
+    try {
+      lineResult = await pushLineImageMessage(
+        mapping.line_user_id,
+        workflowMessage.originalContentUrl,
+        workflowMessage.previewImageUrl,
+        lineChannelSelection.channelAccessToken
+      );
+    } catch (error) {
+      const lineError = getSafeLineErrorMetadata(error);
+      const errorMessage = "LINE image send failed";
+      const requestPayload = {
+        ...eventPayload,
+        source: "ghl_workflow_image_direct",
+        tenantId: mapping.tenant_id,
+        lineChannelId: lineChannelSelection.lineChannelId ?? null,
+        channelTokenSource: lineChannelSelection.channelTokenSource,
+        channelConnected: true,
+        channelResolutionStatus: "success",
+        lineResultStatus: "failed",
+        lineHttpStatusCode: lineError.statusCode ?? null,
+        lineRequestId: lineError.lineRequestId ?? null,
+        lineErrorCategory: lineError.category,
+        mirrorResultStatus: "unsupported"
+      };
+      const auditPersistenceStatus = await persistWorkflowImageAudit({
+        requestId: context.requestId,
+        locationId,
+        mapping,
+        externalMessageId: attemptExternalMessageId,
+        payload: sanitizedPayload,
+        status: "failed",
+        errorMessage,
+        requestPayload,
+        lineResultStatus: "failed",
+        lineHttpStatusCode: lineError.statusCode
+      });
+
+      logger.error(
+        {
+          requestId: context.requestId,
+          locationId,
+          tenantId: mapping.tenant_id,
+          selectedMessageType: workflowMessage.type,
+          originalImageUrlPresent: workflowMessage.inputPresence.originalImageUrlPresent,
+          previewImageUrlPresent: workflowMessage.inputPresence.previewImageUrlPresent,
+          channelResolutionStatus: "success",
+          channelConnected: true,
+          lineResultStatus: "failed",
+          lineHttpStatusCode: lineError.statusCode,
+          lineRequestId: lineError.lineRequestId,
+          lineErrorCategory: lineError.category,
+          mirrorResultStatus: "unsupported",
+          auditPersistenceStatus,
+          lineChannelId: lineChannelSelection.lineChannelId,
+          channelTokenSource: lineChannelSelection.channelTokenSource
+        },
+        "LINE rejected or failed the GHL workflow image delivery"
+      );
+
+      return buildResponse(200, "failed", errorMessage);
+    }
+
+    const requestPayload = {
+      ...eventPayload,
+      source: "ghl_workflow_image_direct",
+      tenantId: mapping.tenant_id,
+      lineChannelId: lineChannelSelection.lineChannelId ?? null,
+      channelTokenSource: lineChannelSelection.channelTokenSource,
+      channelConnected: true,
+      channelResolutionStatus: "success",
+      lineResultStatus: "sent",
+      lineHttpStatusCode: lineResult.statusCode,
+      lineRequestId: lineResult.lineRequestId ?? null,
+      acceptedRequestId: lineResult.acceptedRequestId ?? null,
+      acceptedByRetryKey: lineResult.acceptedByRetryKey ?? false,
+      mirrorResultStatus: "unsupported"
+    };
+    const auditPersistenceStatus = await persistWorkflowImageAudit({
+      requestId: context.requestId,
+      locationId,
+      mapping,
+      externalMessageId: buildImageSuccessExternalMessageId(lineResult, attemptExternalMessageId),
+      payload: sanitizedPayload,
+      status: "sent",
+      requestPayload,
+      lineResultStatus: "sent",
+      lineHttpStatusCode: lineResult.statusCode
+    });
+
+    logger.info(
+      {
+        requestId: context.requestId,
+        locationId,
+        tenantId: mapping.tenant_id,
+        selectedMessageType: workflowMessage.type,
+        originalImageUrlPresent: workflowMessage.inputPresence.originalImageUrlPresent,
+        previewImageUrlPresent: workflowMessage.inputPresence.previewImageUrlPresent,
+        channelResolutionStatus: "success",
+        channelConnected: true,
+        lineResultStatus: "sent",
+        lineHttpStatusCode: lineResult.statusCode,
+        lineRequestId: lineResult.lineRequestId,
+        mirrorResultStatus: "unsupported",
+        auditPersistenceStatus,
+        lineChannelId: lineChannelSelection.lineChannelId,
+        channelTokenSource: lineChannelSelection.channelTokenSource,
+        lineMessageId: lineResult.messageId
+      },
+      "GHL workflow LINE image sent without Inbox mirroring"
+    );
+
+    return buildResponse(200, "sent", "", lineResult.messageId ?? null);
+  }
+
   if (env.GHL_WORKFLOW_LINE_DELIVERY_MODE === "provider_first") {
     try {
       const tenant = await getTenantById(mapping.tenant_id);
@@ -369,7 +702,7 @@ export async function processGhlWorkflowSendLine(payload: Record<string, unknown
       const dispatchResult = await mirrorWorkflowOutboundMessageToGhl({
         locationId,
         contactId,
-        message,
+        message: workflowMessage.text,
         conversationProviderId,
         workflowId,
         lineMessageId: null,
@@ -513,7 +846,7 @@ export async function processGhlWorkflowSendLine(payload: Record<string, unknown
 
     const lineResult = await pushLineTextMessage(
       mapping.line_user_id,
-      message,
+      workflowMessage.text,
       lineChannelSelection.channelAccessToken
     );
 
@@ -550,7 +883,7 @@ export async function processGhlWorkflowSendLine(payload: Record<string, unknown
         eventPayload,
         locationId,
         contactId,
-        message,
+        message: workflowMessage.text,
         workflowId,
         metaKey,
         externalMessageId,

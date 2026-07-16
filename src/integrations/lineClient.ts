@@ -4,8 +4,12 @@ import type { LineProfile } from "../types/line";
 
 const lineApiBaseUrl = "https://api.line.me";
 
-export type LinePushTextMessageResult = {
+export type LinePushMessageResult = {
   messageId?: string;
+  statusCode: number;
+  lineRequestId?: string;
+  acceptedRequestId?: string;
+  acceptedByRetryKey?: boolean;
   raw?: {
     sentMessages?: Array<{
       id?: string;
@@ -14,6 +18,63 @@ export type LinePushTextMessageResult = {
     [key: string]: unknown;
   };
 };
+
+export type LinePushTextMessageResult = LinePushMessageResult;
+
+export type LinePushTextMessage = {
+  type: "text";
+  text: string;
+};
+
+export type LinePushImageMessage = {
+  type: "image";
+  originalContentUrl: string;
+  previewImageUrl: string;
+};
+
+export type LinePushMessage = LinePushTextMessage | LinePushImageMessage;
+
+export type LineApiErrorCategory =
+  | "authentication"
+  | "authorization"
+  | "invalid_request"
+  | "not_found"
+  | "conflict"
+  | "rate_limited"
+  | "server_error"
+  | "network_error"
+  | "invalid_response"
+  | "unknown_http_error"
+  | "invalid_retry_key";
+
+export class LineApiError extends Error {
+  public readonly statusCode?: number;
+  public readonly lineRequestId?: string;
+  public readonly category: LineApiErrorCategory;
+
+  constructor(input: {
+    category: LineApiErrorCategory;
+    statusCode?: number;
+    lineRequestId?: string;
+  }) {
+    const status = input.statusCode ? `, status ${input.statusCode}` : "";
+    super(`LINE API request failed (${input.category}${status})`);
+    this.name = "LineApiError";
+    this.statusCode = input.statusCode;
+    this.lineRequestId = input.lineRequestId;
+    this.category = input.category;
+  }
+}
+
+type LineRequestResult<T> = {
+  data: T;
+  statusCode: number;
+  lineRequestId?: string;
+  acceptedRequestId?: string;
+  acceptedByRetryKey?: boolean;
+};
+
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type LineBotInfo = {
   userId?: string;
@@ -57,33 +118,163 @@ export function verifyLineSignature(
   return crypto.timingSafeEqual(expectedBuffer, actualBuffer);
 }
 
-async function lineRequest<T>(path: string, init?: RequestInit, channelAccessToken?: string): Promise<T> {
-  const response = await fetch(`${lineApiBaseUrl}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${resolveLineChannelAccessToken(channelAccessToken)}`,
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {})
+function getLineErrorCategory(statusCode: number): LineApiErrorCategory {
+  if (statusCode === 400 || statusCode === 422) {
+    return "invalid_request";
+  }
+
+  if (statusCode === 401) {
+    return "authentication";
+  }
+
+  if (statusCode === 403) {
+    return "authorization";
+  }
+
+  if (statusCode === 404) {
+    return "not_found";
+  }
+
+  if (statusCode === 409) {
+    return "conflict";
+  }
+
+  if (statusCode === 429) {
+    return "rate_limited";
+  }
+
+  if (statusCode >= 500) {
+    return "server_error";
+  }
+
+  return "unknown_http_error";
+}
+
+function getHeaderValue(response: Response, headerName: string): string | undefined {
+  const value = response.headers.get(headerName)?.trim();
+  return value || undefined;
+}
+
+async function getSafeAcceptedRetryData<T>(response: Response): Promise<T> {
+  try {
+    const body = (await response.json()) as unknown;
+
+    if (typeof body !== "object" || body === null || !("sentMessages" in body)) {
+      return undefined as T;
     }
-  });
+
+    const sentMessages = Array.isArray(body.sentMessages)
+      ? body.sentMessages.flatMap((entry) => {
+          if (typeof entry !== "object" || entry === null || !("id" in entry)) {
+            return [];
+          }
+
+          const id = typeof entry.id === "string" || typeof entry.id === "number"
+            ? String(entry.id)
+            : undefined;
+          const quoteToken = "quoteToken" in entry && typeof entry.quoteToken === "string"
+            ? entry.quoteToken
+            : undefined;
+
+          return id ? [{ id, quoteToken }] : [];
+        })
+      : [];
+
+    return { sentMessages } as T;
+  } catch {
+    return undefined as T;
+  }
+}
+
+async function lineRequestWithMetadata<T>(
+  path: string,
+  init?: RequestInit,
+  channelAccessToken?: string,
+  options: { retryKey?: string; acceptRetryConflict?: boolean } = {}
+): Promise<LineRequestResult<T>> {
+  const retryKey = options.retryKey?.trim();
+
+  if (options.retryKey !== undefined && (!retryKey || !uuidPattern.test(retryKey))) {
+    throw new LineApiError({ category: "invalid_retry_key" });
+  }
+
+  let response: Response;
+
+  try {
+    response = await fetch(`${lineApiBaseUrl}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${resolveLineChannelAccessToken(channelAccessToken)}`,
+        "Content-Type": "application/json",
+        ...(retryKey ? { "X-Line-Retry-Key": retryKey } : {}),
+        ...(init?.headers ?? {})
+      }
+    });
+  } catch {
+    throw new LineApiError({ category: "network_error" });
+  }
+
+  const lineRequestId = getHeaderValue(response, "X-Line-Request-Id");
+  const acceptedRequestId = getHeaderValue(response, "X-Line-Accepted-Request-Id");
+
+  if (
+    response.status === 409 &&
+    options.acceptRetryConflict &&
+    retryKey &&
+    acceptedRequestId
+  ) {
+    return {
+      data: await getSafeAcceptedRetryData<T>(response),
+      statusCode: response.status,
+      lineRequestId,
+      acceptedRequestId,
+      acceptedByRetryKey: true
+    };
+  }
 
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`LINE API ${response.status} ${response.statusText}: ${body}`);
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Ignore cleanup failures and preserve the safe typed LINE error below.
+    }
+
+    throw new LineApiError({
+      category: getLineErrorCategory(response.status),
+      statusCode: response.status,
+      lineRequestId
+    });
   }
 
   if (response.status === 204) {
-    return undefined as T;
+    return { data: undefined as T, statusCode: response.status, lineRequestId };
   }
 
-  return (await response.json()) as T;
+  try {
+    return {
+      data: (await response.json()) as T,
+      statusCode: response.status,
+      lineRequestId
+    };
+  } catch {
+    throw new LineApiError({
+      category: "invalid_response",
+      statusCode: response.status,
+      lineRequestId
+    });
+  }
+}
+
+async function lineRequest<T>(path: string, init?: RequestInit, channelAccessToken?: string): Promise<T> {
+  const result = await lineRequestWithMetadata<T>(path, init, channelAccessToken);
+  return result.data;
 }
 
 export async function getLineProfile(userId: string, channelAccessToken?: string): Promise<LineProfile | null> {
   try {
     return await lineRequest<LineProfile>(`/v2/bot/profile/${encodeURIComponent(userId)}`, undefined, channelAccessToken);
   } catch (error) {
-    if (error instanceof Error && error.message.includes("404")) {
+    if (error instanceof LineApiError && error.statusCode === 404) {
       return null;
     }
 
@@ -99,30 +290,58 @@ export async function validateLineChannelAccessToken(channelAccessToken: string)
   await getLineBotInfo(channelAccessToken);
 }
 
-export async function pushLineTextMessage(
+async function pushLineMessage(
   to: string,
-  text: string,
-  channelAccessToken?: string
-): Promise<LinePushTextMessageResult> {
-  const response = await lineRequest<LinePushTextMessageResult["raw"] | undefined>(
+  message: LinePushMessage,
+  channelAccessToken?: string,
+  retryKey?: string
+): Promise<LinePushMessageResult> {
+  const result = await lineRequestWithMetadata<LinePushMessageResult["raw"] | undefined>(
     "/v2/bot/message/push",
     {
       method: "POST",
       body: JSON.stringify({
         to,
-        messages: [
-          {
-            type: "text",
-            text
-          }
-        ]
+        messages: [message]
       })
     },
-    channelAccessToken
+    channelAccessToken,
+    { retryKey, acceptRetryConflict: true }
   );
 
   return {
-    messageId: response?.sentMessages?.[0]?.id,
-    raw: response
+    messageId: result.data?.sentMessages?.[0]?.id,
+    statusCode: result.statusCode,
+    lineRequestId: result.lineRequestId,
+    acceptedRequestId: result.acceptedRequestId,
+    acceptedByRetryKey: result.acceptedByRetryKey,
+    raw: result.data
   };
+}
+
+export async function pushLineTextMessage(
+  to: string,
+  text: string,
+  channelAccessToken?: string
+): Promise<LinePushMessageResult> {
+  return pushLineMessage(to, { type: "text", text }, channelAccessToken);
+}
+
+export async function pushLineImageMessage(
+  to: string,
+  originalContentUrl: string,
+  previewImageUrl: string,
+  channelAccessToken?: string,
+  retryKey?: string
+): Promise<LinePushMessageResult> {
+  return pushLineMessage(
+    to,
+    {
+      type: "image",
+      originalContentUrl,
+      previewImageUrl
+    },
+    channelAccessToken,
+    retryKey
+  );
 }
