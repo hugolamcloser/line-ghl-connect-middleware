@@ -1,5 +1,6 @@
 const { afterEach, test } = require("node:test");
 const assert = require("node:assert/strict");
+const pino = require("pino");
 
 process.env.NODE_ENV = "test";
 process.env.LOG_LEVEL = "silent";
@@ -9,6 +10,7 @@ process.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "provider_first";
 
 const config = require("../dist/config/env");
 const loggerModule = require("../dist/config/logger");
+const ghlOAuthService = require("../dist/services/ghlOAuthService");
 const repository = require("../dist/services/repository");
 const workflowOutboundClient = require("../dist/integrations/ghlWorkflowOutboundMirrorClient");
 const lineClient = require("../dist/integrations/lineClient");
@@ -21,6 +23,8 @@ const patchedExports = [
   [repository, "getTenantById"],
   [repository, "saveMessageEvent"],
   [workflowOutboundClient, "mirrorWorkflowOutboundMessageToGhl"],
+  [ghlOAuthService, "getGhlAuthContext"],
+  [ghlOAuthService, "forceRefreshGhlAuthContext"],
   [lineOutboundChannelService, "resolveLineChannelForOutbound"],
   [lineClient, "pushLineTextMessage"],
   [lineClient, "pushLineImageMessage"],
@@ -205,6 +209,143 @@ test("explicit text request retains the exact existing outbound message", async 
     existingGhlConversationId: "conversation_exact"
   });
   assert.equal(calls.imagePushes.length, 0);
+});
+
+test("provider-first text structured logs contain metadata but no message or customer identifiers", async () => {
+  const calls = setupHarness();
+  const sensitiveText = "private outbound customer message";
+  const payload = textPayload({ messageType: "text", message: sensitiveText });
+
+  const result = await ghlWorkflowActionService.processGhlWorkflowSendLine(
+    payload,
+    { requestId: "safe_request_correlation" }
+  );
+  const serializedLogs = JSON.stringify(calls.logs);
+
+  assert.equal(result.body.status, "sent");
+  assert.doesNotMatch(
+    serializedLogs,
+    /private outbound customer message|location_exact|contact_exact|tenant_exact|line_user_exact|line_channel_exact|conversation_exact|workflow_exact/
+  );
+  assert.equal(
+    calls.logs.some(({ args }) =>
+      args[0]?.selectedMessageType === "text" &&
+      args[0]?.messagePresent === true &&
+      args[0]?.messageLength === sensitiveText.length &&
+      args[0]?.providerDispatchStatus === "success"
+    ),
+    true
+  );
+});
+
+test("HighLevel mirror client logs no request text, OAuth token, or complete identifiers", async () => {
+  const calls = setupHarness();
+  const originalMirror = originals.find(
+    ([module, key]) => module === workflowOutboundClient && key === "mirrorWorkflowOutboundMessageToGhl"
+  )[2];
+  ghlOAuthService.getGhlAuthContext = async () => ({
+    mode: "oauth",
+    accessToken: "oauth_token_sensitive",
+    locationId: "location_sensitive"
+  });
+  global.fetch = async () => new Response(JSON.stringify({
+    messageId: "ghl_message_sensitive",
+    conversationId: "conversation_sensitive",
+    message: "private provider response content"
+  }), {
+    status: 201,
+    headers: { "Content-Type": "application/json" }
+  });
+
+  await originalMirror({
+    requestId: "safe_request_correlation",
+    locationId: "location_sensitive",
+    contactId: "contact_sensitive",
+    message: "private outbound customer message",
+    conversationProviderId: "provider_sensitive",
+    workflowId: "workflow_sensitive",
+    lineMessageId: "line_message_sensitive",
+    existingGhlConversationId: "conversation_existing_sensitive"
+  });
+  const serializedLogs = JSON.stringify(calls.logs);
+
+  assert.doesNotMatch(
+    serializedLogs,
+    /oauth_token_sensitive|private outbound customer message|private provider response content|location_sensitive|contact_sensitive|provider_sensitive|workflow_sensitive|line_message_sensitive|conversation_sensitive|conversation_existing_sensitive|ghl_message_sensitive/
+  );
+  assert.equal(
+    calls.logs.some(({ args }) =>
+      args[0]?.messagePresent === true &&
+      args[0]?.messageLength === "private outbound customer message".length &&
+      args[0]?.providerDispatchStatus === "success" &&
+      args[0]?.ghlMessageIdPresent === true
+    ),
+    true
+  );
+});
+
+test("logger redaction safety net censors project headers, nested bodies, identifiers, and messages", () => {
+  let output = "";
+  const privacyLogger = pino({
+    redact: {
+      paths: [...loggerModule.logRedactionPaths],
+      censor: "[redacted]"
+    }
+  }, {
+    write(chunk) {
+      output += chunk;
+    }
+  });
+
+  privacyLogger.info({
+    req: {
+      headers: {
+        authorization: "Bearer request-authorization-sensitive",
+        "x-wincrm-webhook-secret": "request-workflow-secret-sensitive",
+        "x-webhook-secret": "request-legacy-webhook-secret-sensitive",
+        "x-provider-secret": "request-provider-secret-sensitive",
+        "x-ghl-secret": "request-ghl-secret-sensitive",
+        "x-line-signature": "request-line-signature-sensitive",
+        "x-ghl-signature": "request-ghl-signature-sensitive",
+        "x-wh-signature": "request-wh-signature-sensitive"
+      }
+    },
+    response: {
+      headers: {
+        "set-cookie": "response-cookie-sensitive",
+        "proxy-authorization": "response-proxy-authorization-sensitive",
+        "x-access-token": "response-access-token-sensitive",
+        "x-refresh-token": "response-refresh-token-sensitive"
+      }
+    },
+    contactId: "contact_sensitive",
+    conversationId: "conversation_sensitive",
+    tenantId: "tenant_sensitive",
+    lineUserId: "line_user_sensitive",
+    lineChannelId: "line_channel_sensitive",
+    ghlMessageId: "ghl_message_sensitive",
+    requestBody: { message: "private outbound customer message" },
+    responseBody: { message: "private provider response content" },
+    payload: {
+      requestBody: { message: "private nested request content" },
+      responseBody: { text: "private nested response content" }
+    },
+    originalImageUrl: "https://media.example.com/private/original.png?signature=private-value",
+    errorMessage: "Provider rejected https://media.example.com/private/error.png?signature=error-private-value",
+    providerDispatchStatus: "success",
+    statusCode: 201,
+    locationIdPresent: true
+  });
+
+  assert.doesNotMatch(
+    output,
+    /request-authorization-sensitive|request-workflow-secret-sensitive|request-legacy-webhook-secret-sensitive|request-provider-secret-sensitive|request-ghl-secret-sensitive|request-line-signature-sensitive|request-wh-signature-sensitive|response-cookie-sensitive|response-proxy-authorization-sensitive|response-access-token-sensitive|response-refresh-token-sensitive|contact_sensitive|conversation_sensitive|tenant_sensitive|line_user_sensitive|line_channel_sensitive|ghl_message_sensitive|private outbound customer message|private provider response content|private nested request content|private nested response content|media\.example\.com|original\.png|error\.png|private-value/
+  );
+  assert.match(output, /\[redacted\]/);
+  assert.match(output, /providerDispatchStatus/);
+  assert.match(output, /success/);
+  assert.match(output, /"statusCode":201/);
+  assert.match(output, /"locationIdPresent":true/);
 });
 
 test("the existing LINE text client request body remains unchanged", async () => {
@@ -673,10 +814,15 @@ test("image response and structured logs never contain media URLs or signed valu
   const payload = imagePayload();
   const result = await ghlWorkflowActionService.processGhlWorkflowSendLine(payload, { requestId: "request_exact" });
   const exposed = JSON.stringify({ response: result, logs: calls.logs });
+  const serializedLogs = JSON.stringify(calls.logs);
 
   assert.doesNotMatch(exposed, /media\.example\.com/);
   assert.doesNotMatch(exposed, /original\.png|preview\.png/);
   assert.doesNotMatch(exposed, /private-value/);
+  assert.doesNotMatch(
+    serializedLogs,
+    /location_exact|contact_exact|tenant_exact|line_user_exact|line_channel_exact|conversation_exact|workflow_exact|line_image_exact/
+  );
   assert.match(exposed, /request_exact/);
   assert.match(exposed, /mirrorResultStatus/);
 });

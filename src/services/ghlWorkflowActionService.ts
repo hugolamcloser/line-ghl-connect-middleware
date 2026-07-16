@@ -30,6 +30,7 @@ import {
   type WorkflowLineMessage,
   type WorkflowLineMessageInputPresence
 } from "./workflowLineMessageBuilder";
+import { buildMessageLogMetadata, buildShortLogRef, hasLogValue } from "../utils/logPrivacy";
 
 type WorkflowSendLineStatus = "sent" | "skipped" | "failed";
 
@@ -66,6 +67,57 @@ function getWorkflowContextString(
   key: "locationId" | "contactId" | "workflowId"
 ): string | undefined {
   return getString(extras[key]) ?? getString(payload[key]);
+}
+
+function getWorkflowActionField(payload: Record<string, unknown>, key: string): unknown {
+  const data = getRecord(payload.data);
+  return Object.prototype.hasOwnProperty.call(data, key) ? data[key] : payload[key];
+}
+
+function buildWorkflowInputLogMetadata(payload: Record<string, unknown>): Record<string, unknown> {
+  const messageType = getWorkflowActionField(payload, "messageType");
+  const normalizedMessageType = typeof messageType === "string" ? messageType.trim().toLowerCase() : undefined;
+  const message = getWorkflowActionField(payload, "message");
+
+  return {
+    selectedMessageType:
+      messageType === undefined || messageType === null || normalizedMessageType === ""
+        ? "text"
+        : normalizedMessageType === "text" || normalizedMessageType === "image"
+          ? normalizedMessageType
+          : "invalid",
+    ...buildMessageLogMetadata(message),
+    originalImageUrlPresent: hasLogValue(getWorkflowActionField(payload, "originalImageUrl")),
+    previewImageUrlPresent: hasLogValue(getWorkflowActionField(payload, "previewImageUrl"))
+  };
+}
+
+function buildWorkflowIdentifierLogContext(input: {
+  requestId?: string;
+  locationId?: string;
+  contactId?: string;
+  workflowId?: string;
+  mapping?: LineProfileRecord | null;
+  lineChannelId?: string | null;
+  lineMessageId?: string | null;
+  ghlMessageId?: string | null;
+  ghlConversationId?: string | null;
+}): Record<string, unknown> {
+  return {
+    requestId: input.requestId,
+    locationIdPresent: hasLogValue(input.locationId),
+    locationRef: buildShortLogRef(input.locationId),
+    contactIdPresent: hasLogValue(input.contactId),
+    contactRef: buildShortLogRef(input.contactId),
+    workflowIdPresent: hasLogValue(input.workflowId),
+    mappingFound: Boolean(input.mapping),
+    tenantRef: buildShortLogRef(input.mapping?.tenant_id),
+    lineUserIdPresent: hasLogValue(input.mapping?.line_user_id),
+    conversationIdPresent: hasLogValue(input.ghlConversationId ?? input.mapping?.ghl_conversation_id),
+    channelRef: buildShortLogRef(input.lineChannelId ?? input.mapping?.line_channel_id),
+    lineMessageIdPresent: hasLogValue(input.lineMessageId),
+    ghlMessageIdPresent: hasLogValue(input.ghlMessageId)
+  };
 }
 
 function buildResponse(
@@ -203,9 +255,11 @@ async function persistWorkflowImageAudit(input: {
   } catch {
     logger.error(
       {
-        requestId: input.requestId,
-        locationId: input.locationId,
-        tenantId: input.mapping.tenant_id,
+        ...buildWorkflowIdentifierLogContext({
+          requestId: input.requestId,
+          locationId: input.locationId,
+          mapping: input.mapping
+        }),
         selectedMessageType: "image",
         lineResultStatus: input.lineResultStatus,
         lineHttpStatusCode: input.lineHttpStatusCode,
@@ -279,6 +333,7 @@ function buildMirrorRequestPayload(input: {
 }
 
 async function mirrorWorkflowOutboundMessage(input: {
+  requestId?: string;
   payload: Record<string, unknown>;
   eventPayload: Record<string, unknown>;
   locationId: string;
@@ -295,6 +350,7 @@ async function mirrorWorkflowOutboundMessage(input: {
   }
 
   const mirrorResult = await mirrorWorkflowOutboundMessageToGhl({
+    ...(input.requestId ? { requestId: input.requestId } : {}),
     locationId: input.locationId,
     contactId: input.contactId,
     message: input.message,
@@ -334,16 +390,20 @@ async function mirrorWorkflowOutboundMessage(input: {
 
   logger.info(
     {
-      locationId: input.locationId,
-      contactId: input.contactId,
-      tenantId: input.mapping.tenant_id,
-      lineUserId: input.mapping.line_user_id,
-      workflowId: input.workflowId,
-      metaKey: input.metaKey,
-      mirrorExternalMessageId,
-      lineMessageId: input.lineMessageId,
-      ghlConversationId: mirrorResult.ghlConversationId ?? input.mapping.ghl_conversation_id,
-      ghlMessageId: mirrorResult.ghlMessageId,
+      ...buildWorkflowIdentifierLogContext({
+        requestId: input.requestId,
+        locationId: input.locationId,
+        contactId: input.contactId,
+        workflowId: input.workflowId,
+        mapping: input.mapping,
+        lineMessageId: input.lineMessageId,
+        ghlMessageId: mirrorResult.ghlMessageId,
+        ghlConversationId: mirrorResult.ghlConversationId
+      }),
+      selectedMessageType: "text",
+      ...buildMessageLogMetadata(input.message),
+      metaKeyPresent: hasLogValue(input.metaKey),
+      mirrorExternalMessageIdPresent: hasLogValue(mirrorExternalMessageId),
       mirrorStatus,
       statusCode: mirrorResult.statusCode,
       canonicalCode: mirrorResult.canonicalCode
@@ -354,7 +414,8 @@ async function mirrorWorkflowOutboundMessage(input: {
 
 async function resolveLineProfileByLocationAndGhlContact(
   locationId: string,
-  contactId: string
+  contactId: string,
+  requestId?: string
 ): Promise<{ tenantIds: string[]; mapping: LineProfileRecord | null }> {
   const normalizedLocationId = locationId.trim();
   const normalizedContactId = contactId.trim();
@@ -363,8 +424,11 @@ async function resolveLineProfileByLocationAndGhlContact(
   if (tenantIds.length === 0) {
     logger.info(
       {
-        locationId: normalizedLocationId,
-        contactId: normalizedContactId,
+        ...buildWorkflowIdentifierLogContext({
+          requestId,
+          locationId: normalizedLocationId,
+          contactId: normalizedContactId
+        }),
         tenantCount: 0,
         mappingFound: false
       },
@@ -380,13 +444,14 @@ async function resolveLineProfileByLocationAndGhlContact(
 
   logger.info(
     {
-      locationId: normalizedLocationId,
-      contactId: normalizedContactId,
+      ...buildWorkflowIdentifierLogContext({
+        requestId,
+        locationId: normalizedLocationId,
+        contactId: normalizedContactId,
+        mapping
+      }),
       tenantCount: tenantIds.length,
-      mappingFound: Boolean(mapping),
-      foundTenantId: mapping?.tenant_id,
-      foundLineUserId: mapping?.line_user_id,
-      foundGhlConversationId: mapping?.ghl_conversation_id
+      mappingFound: Boolean(mapping)
     },
     "GHL workflow LINE mapping lookup completed"
   );
@@ -406,6 +471,7 @@ export async function processGhlWorkflowSendLine(
   const workflowId = getWorkflowContextString(payload, extras, "workflowId");
   const metaKey = getString(meta.key);
   const metaVersion = getString(meta.version);
+  const inputLogMetadata = buildWorkflowInputLogMetadata(payload);
   let workflowMessage: WorkflowLineMessage;
 
   try {
@@ -417,9 +483,13 @@ export async function processGhlWorkflowSendLine(
 
     logger.warn(
       {
-        requestId: context.requestId,
-        locationId,
-        selectedMessageType: "invalid",
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          locationId,
+          contactId,
+          workflowId
+        }),
+        ...inputLogMetadata,
         validationStatus: "failed"
       },
       "Rejected invalid GHL workflow LINE message"
@@ -441,12 +511,14 @@ export async function processGhlWorkflowSendLine(
 
   logger.info(
     {
-      requestId: context.requestId,
-      locationId,
-      selectedMessageType: workflowMessage.type,
-      messagePresent: workflowMessage.inputPresence.messagePresent,
-      originalImageUrlPresent: workflowMessage.inputPresence.originalImageUrlPresent,
-      previewImageUrlPresent: workflowMessage.inputPresence.previewImageUrlPresent
+      ...buildWorkflowIdentifierLogContext({
+        requestId: context.requestId,
+        locationId,
+        contactId,
+        workflowId
+      }),
+      ...inputLogMetadata,
+      validationStatus: "accepted"
     },
     "Accepted GHL workflow LINE message input"
   );
@@ -454,9 +526,13 @@ export async function processGhlWorkflowSendLine(
   if (!locationId) {
     logger.warn(
       {
-        contactId,
-        workflowId,
-        metaKey
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          contactId,
+          workflowId
+        }),
+        ...inputLogMetadata,
+        metaKeyPresent: hasLogValue(metaKey)
       },
       "Skipped GHL workflow LINE send because locationId is missing"
     );
@@ -467,9 +543,13 @@ export async function processGhlWorkflowSendLine(
   if (!contactId) {
     logger.warn(
       {
-        locationId,
-        workflowId,
-        metaKey
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          locationId,
+          workflowId
+        }),
+        ...inputLogMetadata,
+        metaKeyPresent: hasLogValue(metaKey)
       },
       "Skipped GHL workflow LINE send because contactId is missing"
     );
@@ -479,15 +559,20 @@ export async function processGhlWorkflowSendLine(
       : buildResponse(200, "skipped", "No LINE mapping found for contact");
   }
 
-  const { mapping } = await resolveLineProfileByLocationAndGhlContact(locationId, contactId);
+  const { mapping } = await resolveLineProfileByLocationAndGhlContact(locationId, contactId, context.requestId);
 
   if (!mapping) {
     logger.warn(
       {
-        locationId,
-        contactId,
-        workflowId,
-        metaKey
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          locationId,
+          contactId,
+          workflowId,
+          mapping: null
+        }),
+        ...inputLogMetadata,
+        metaKeyPresent: hasLogValue(metaKey)
       },
       "Skipped GHL workflow LINE send because no LINE mapping exists"
     );
@@ -538,21 +623,25 @@ export async function processGhlWorkflowSendLine(
       });
 
       const logContext = {
-        requestId: context.requestId,
-        locationId,
-        tenantId: mapping.tenant_id,
-        selectedMessageType: workflowMessage.type,
-        originalImageUrlPresent: workflowMessage.inputPresence.originalImageUrlPresent,
-        previewImageUrlPresent: workflowMessage.inputPresence.previewImageUrlPresent,
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          locationId,
+          contactId,
+          workflowId,
+          mapping,
+          lineChannelId: requestPayload.lineChannelId
+        }),
+        ...inputLogMetadata,
         channelResolutionStatus: "failed",
+        channelConnected: false,
         lineResultStatus: "not_attempted",
         lineHttpStatusCode: null,
         lineErrorCategory: "channel_resolution",
         mirrorResultStatus: "unsupported",
         auditPersistenceStatus,
-        lineChannelId: requestPayload.lineChannelId,
         channelTokenSource: requestPayload.channelTokenSource,
-        errorMessage
+        errorPresent: true,
+        errorCategory: isDisconnected ? "channel_not_connected" : "channel_resolution"
       };
 
       if (isDisconnected) {
@@ -605,21 +694,24 @@ export async function processGhlWorkflowSendLine(
 
       logger.error(
         {
-          requestId: context.requestId,
-          locationId,
-          tenantId: mapping.tenant_id,
-          selectedMessageType: workflowMessage.type,
-          originalImageUrlPresent: workflowMessage.inputPresence.originalImageUrlPresent,
-          previewImageUrlPresent: workflowMessage.inputPresence.previewImageUrlPresent,
+          ...buildWorkflowIdentifierLogContext({
+            requestId: context.requestId,
+            locationId,
+            contactId,
+            workflowId,
+            mapping,
+            lineChannelId: lineChannelSelection.lineChannelId
+          }),
+          ...inputLogMetadata,
           channelResolutionStatus: "success",
           channelConnected: true,
           lineResultStatus: "failed",
           lineHttpStatusCode: lineError.statusCode,
-          lineRequestId: lineError.lineRequestId,
+          lineRequestIdPresent: hasLogValue(lineError.lineRequestId),
+          lineRequestRef: buildShortLogRef(lineError.lineRequestId),
           lineErrorCategory: lineError.category,
           mirrorResultStatus: "unsupported",
           auditPersistenceStatus,
-          lineChannelId: lineChannelSelection.lineChannelId,
           channelTokenSource: lineChannelSelection.channelTokenSource
         },
         "LINE rejected or failed the GHL workflow image delivery"
@@ -657,22 +749,25 @@ export async function processGhlWorkflowSendLine(
 
     logger.info(
       {
-        requestId: context.requestId,
-        locationId,
-        tenantId: mapping.tenant_id,
-        selectedMessageType: workflowMessage.type,
-        originalImageUrlPresent: workflowMessage.inputPresence.originalImageUrlPresent,
-        previewImageUrlPresent: workflowMessage.inputPresence.previewImageUrlPresent,
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          locationId,
+          contactId,
+          workflowId,
+          mapping,
+          lineChannelId: lineChannelSelection.lineChannelId,
+          lineMessageId: lineResult.messageId
+        }),
+        ...inputLogMetadata,
         channelResolutionStatus: "success",
         channelConnected: true,
         lineResultStatus: "sent",
         lineHttpStatusCode: lineResult.statusCode,
-        lineRequestId: lineResult.lineRequestId,
+        lineRequestIdPresent: hasLogValue(lineResult.lineRequestId),
+        lineRequestRef: buildShortLogRef(lineResult.lineRequestId),
         mirrorResultStatus: "unsupported",
         auditPersistenceStatus,
-        lineChannelId: lineChannelSelection.lineChannelId,
-        channelTokenSource: lineChannelSelection.channelTokenSource,
-        lineMessageId: lineResult.messageId
+        channelTokenSource: lineChannelSelection.channelTokenSource
       },
       "GHL workflow LINE image sent without Inbox mirroring"
     );
@@ -700,6 +795,7 @@ export async function processGhlWorkflowSendLine(
 
       const lineChannelSelection = await resolveLineChannelForOutbound(mapping.tenant_id, mapping);
       const dispatchResult = await mirrorWorkflowOutboundMessageToGhl({
+        ...(context.requestId ? { requestId: context.requestId } : {}),
         locationId,
         contactId,
         message: workflowMessage.text,
@@ -751,17 +847,22 @@ export async function processGhlWorkflowSendLine(
 
       logger.info(
         {
-          locationId,
-          contactId,
-          workflowId,
-          metaKey,
-          tenantId: mapping.tenant_id,
-          lineUserId: mapping.line_user_id,
-          lineChannelId: lineChannelSelection.lineChannelId,
+          ...buildWorkflowIdentifierLogContext({
+            requestId: context.requestId,
+            locationId,
+            contactId,
+            workflowId,
+            mapping,
+            lineChannelId: lineChannelSelection.lineChannelId,
+            ghlMessageId: dispatchResult.ghlMessageId,
+            ghlConversationId: dispatchResult.ghlConversationId
+          }),
+          ...inputLogMetadata,
+          metaKeyPresent: hasLogValue(metaKey),
+          channelConnected: true,
           channelTokenSource: lineChannelSelection.channelTokenSource,
-          ghlConversationId: dispatchResult.ghlConversationId ?? mapping.ghl_conversation_id,
-          ghlMessageId: dispatchResult.ghlMessageId,
-          dispatchStatus,
+          conversationProviderIdPresent: true,
+          providerDispatchStatus: dispatchStatus,
           statusCode: dispatchResult.statusCode
         },
         "HighLevel workflow provider dispatch completed"
@@ -801,15 +902,21 @@ export async function processGhlWorkflowSendLine(
       });
 
       const logContext = {
-        locationId,
-        contactId,
-        workflowId,
-        metaKey,
-        tenantId: mapping.tenant_id,
-        lineUserId: mapping.line_user_id,
-        lineChannelId: requestPayload.lineChannelId,
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          locationId,
+          contactId,
+          workflowId,
+          mapping,
+          lineChannelId: requestPayload.lineChannelId
+        }),
+        ...inputLogMetadata,
+        metaKeyPresent: hasLogValue(metaKey),
+        channelConnected: false,
         channelTokenSource: requestPayload.channelTokenSource,
-        errorMessage
+        providerDispatchStatus: "failed",
+        errorPresent: true,
+        errorCategory: isDisconnected ? "channel_not_connected" : "provider_dispatch"
       };
 
       if (isDisconnected) {
@@ -833,12 +940,17 @@ export async function processGhlWorkflowSendLine(
 
     logger.info(
       {
-        locationId,
-        contactId,
-        workflowId,
-        metaKey,
-        tenantId: mapping.tenant_id,
-        lineChannelId: lineChannelSelection.lineChannelId,
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          locationId,
+          contactId,
+          workflowId,
+          mapping,
+          lineChannelId: lineChannelSelection.lineChannelId
+        }),
+        ...inputLogMetadata,
+        metaKeyPresent: hasLogValue(metaKey),
+        channelConnected: true,
         channelTokenSource: lineChannelSelection.channelTokenSource
       },
       "Selected LINE channel token source for GHL workflow LINE send"
@@ -864,21 +976,28 @@ export async function processGhlWorkflowSendLine(
 
     logger.info(
       {
-        locationId,
-        contactId,
-        workflowId,
-        metaKey,
-        tenantId: mapping.tenant_id,
-        lineUserId: mapping.line_user_id,
-        lineChannelId: lineChannelSelection.lineChannelId,
+        ...buildWorkflowIdentifierLogContext({
+          requestId: context.requestId,
+          locationId,
+          contactId,
+          workflowId,
+          mapping,
+          lineChannelId: lineChannelSelection.lineChannelId,
+          lineMessageId: lineResult.messageId
+        }),
+        ...inputLogMetadata,
+        metaKeyPresent: hasLogValue(metaKey),
+        channelConnected: true,
         channelTokenSource: lineChannelSelection.channelTokenSource,
-        lineMessageId: lineResult.messageId
+        lineResultStatus: "sent",
+        lineHttpStatusCode: lineResult.statusCode
       },
       "GHL workflow LINE message sent"
     );
 
     try {
       await mirrorWorkflowOutboundMessage({
+        requestId: context.requestId,
         payload,
         eventPayload,
         locationId,
@@ -893,16 +1012,19 @@ export async function processGhlWorkflowSendLine(
     } catch (mirrorError) {
       logger.error(
         {
-          locationId,
-          contactId,
-          workflowId,
-          metaKey,
-          tenantId: mapping.tenant_id,
-          lineUserId: mapping.line_user_id,
-          lineMessageId: lineResult.messageId,
-          ghlConversationId: mapping.ghl_conversation_id,
+          ...buildWorkflowIdentifierLogContext({
+            requestId: context.requestId,
+            locationId,
+            contactId,
+            workflowId,
+            mapping,
+            lineMessageId: lineResult.messageId
+          }),
+          ...inputLogMetadata,
+          metaKeyPresent: hasLogValue(metaKey),
           mirrorStatus: "failed",
-          errorMessage: mirrorError instanceof Error ? mirrorError.message : String(mirrorError)
+          errorPresent: true,
+          errorCategory: mirrorError instanceof Error ? mirrorError.name : "unknown"
         },
         "HighLevel workflow outbound mirror failed after LINE send succeeded"
       );
@@ -939,15 +1061,21 @@ export async function processGhlWorkflowSendLine(
     });
 
     const logContext = {
-      locationId,
-      contactId,
-      workflowId,
-      metaKey,
-      tenantId: mapping.tenant_id,
-      lineUserId: mapping.line_user_id,
-      lineChannelId: requestPayload.lineChannelId,
+      ...buildWorkflowIdentifierLogContext({
+        requestId: context.requestId,
+        locationId,
+        contactId,
+        workflowId,
+        mapping,
+        lineChannelId: requestPayload.lineChannelId
+      }),
+      ...inputLogMetadata,
+      metaKeyPresent: hasLogValue(metaKey),
+      channelConnected: false,
       channelTokenSource: requestPayload.channelTokenSource,
-      errorMessage
+      lineResultStatus: "failed",
+      errorPresent: true,
+      errorCategory: isDisconnected ? "channel_not_connected" : "line_delivery"
     };
 
     if (isDisconnected) {

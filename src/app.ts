@@ -24,6 +24,12 @@ const sensitiveQueryKeyNames = [
   "accessToken",
   "refresh_token",
   "refreshToken",
+  "state",
+  "client_secret",
+  "clientSecret",
+  "id_token",
+  "idToken",
+  "token",
   "channelAccessToken",
   "channelSecret",
   "channel_access_token",
@@ -62,8 +68,18 @@ export function redactSensitiveUrlQuery(rawUrl: string | undefined): string | un
     return changed ? `${parsedUrl.pathname}${parsedUrl.search}` : rawUrl;
   } catch {
     return rawUrl.replace(
-      /([?&](?:code|pageToken|actionToken|access_token|accessToken|refresh_token|refreshToken|channelAccessToken|channelSecret|channel_access_token|channel_secret)=)[^&]*/gi,
-      "$1[redacted]"
+      /([?&])([^=&#]+)=([^&#]*)/g,
+      (matchedParameter, delimiter: string, rawKey: string) => {
+        let decodedKey = rawKey;
+
+        try {
+          decodedKey = decodeURIComponent(rawKey.replace(/\+/g, " "));
+        } catch {
+          // Keep the original key for the case-insensitive safety check.
+        }
+
+        return isSensitiveQueryKey(decodedKey) ? `${delimiter}${rawKey}=[redacted]` : matchedParameter;
+      }
     );
   }
 }
@@ -84,32 +100,29 @@ function redactSensitiveObjectKeys(value: unknown): unknown {
   return redactedValue;
 }
 
-function redactUrlHeaderValue(value: unknown): unknown {
-  if (typeof value === "string") {
-    return redactSensitiveUrlQuery(value);
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((item) => (typeof item === "string" ? redactSensitiveUrlQuery(item) : item));
-  }
-
-  return value;
-}
-
 export function redactRequestHeaders(headers: unknown): unknown {
   if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
     return headers;
   }
 
-  const redactedHeaders = redactSensitiveObjectKeys(headers) as Record<string, unknown>;
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(headers as Record<string, unknown>).map(([key, value]) => [key.toLowerCase(), value])
+  );
+  const isPresent = (key: string): boolean => normalizedHeaders[key] !== undefined;
 
-  for (const key of Object.keys(redactedHeaders)) {
-    if (["referer", "referrer"].includes(key.toLowerCase())) {
-      redactedHeaders[key] = redactUrlHeaderValue(redactedHeaders[key]);
-    }
-  }
-
-  return redactedHeaders;
+  return {
+    headerCount: Object.keys(normalizedHeaders).length,
+    contentTypePresent: isPresent("content-type"),
+    contentLengthPresent: isPresent("content-length"),
+    userAgentPresent: isPresent("user-agent"),
+    requestIdPresent: isPresent("x-request-id"),
+    forwardedForPresent: isPresent("x-forwarded-for") || isPresent("forwarded"),
+    authorizationPresent: isPresent("authorization"),
+    webhookSecretPresent: isPresent("x-wincrm-webhook-secret") || isPresent("x-webhook-secret"),
+    providerSecretPresent: isPresent("x-provider-secret") || isPresent("x-ghl-secret"),
+    signaturePresent:
+      isPresent("x-line-signature") || isPresent("x-ghl-signature") || isPresent("x-wh-signature")
+  };
 }
 
 function redactRequestSerializer(req: IncomingMessage): Record<string, unknown> {
@@ -129,22 +142,30 @@ function redactRequestSerializer(req: IncomingMessage): Record<string, unknown> 
   return serializedReq;
 }
 
-function redactResponseHeaders(headers: unknown): unknown {
+export function redactResponseHeaders(headers: unknown): Record<string, unknown> {
   if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
-    return headers;
+    return { headerCount: 0 };
   }
 
-  const redactedHeaders = { ...(headers as Record<string, unknown>) };
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(headers as Record<string, unknown>).map(([key, value]) => [key.toLowerCase(), value])
+  );
+  const isPresent = (key: string): boolean => normalizedHeaders[key] !== undefined;
 
-  for (const [key, value] of Object.entries(redactedHeaders)) {
-    if (key.toLowerCase() !== "location") {
-      continue;
-    }
-
-    redactedHeaders[key] = redactUrlHeaderValue(value);
-  }
-
-  return redactedHeaders;
+  return {
+    headerCount: Object.keys(normalizedHeaders).length,
+    contentTypePresent: isPresent("content-type"),
+    contentLengthPresent: isPresent("content-length"),
+    locationPresent: isPresent("location"),
+    setCookiePresent: isPresent("set-cookie"),
+    authorizationPresent: isPresent("authorization") || isPresent("proxy-authorization"),
+    accessTokenPresent: isPresent("x-access-token"),
+    refreshTokenPresent: isPresent("x-refresh-token"),
+    webhookSecretPresent: isPresent("x-wincrm-webhook-secret") || isPresent("x-webhook-secret"),
+    providerSecretPresent: isPresent("x-provider-secret") || isPresent("x-ghl-secret"),
+    signaturePresent:
+      isPresent("x-line-signature") || isPresent("x-ghl-signature") || isPresent("x-wh-signature")
+  };
 }
 
 function redactResponseSerializer(res: ServerResponse): Record<string, unknown> {

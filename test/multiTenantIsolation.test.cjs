@@ -20,7 +20,7 @@ const repository = require("../dist/services/repository");
 const oauthService = require("../dist/services/ghlOAuthService");
 const lineOutbound = require("../dist/services/lineOutboundChannelService");
 const signatureVerifier = require("../dist/middleware/ghlWebhookSignature");
-const { createApp, redactRequestHeaders, redactSensitiveUrlQuery } = require("../dist/app");
+const { createApp, redactRequestHeaders, redactResponseHeaders, redactSensitiveUrlQuery } = require("../dist/app");
 
 const repositoryMockKeys = [
   "ensureTenantForLocation",
@@ -521,17 +521,67 @@ test("AppInstall entrypoint keeps duplicate delivery idempotent end to end", asy
 
 test("request logging redacts OAuth codes, tokens, and webhook signatures", () => {
   const redactedUrl = redactSensitiveUrlQuery(
-    "/oauth/callback?code=authorization-sensitive&accessToken=token-sensitive"
+    "/oauth/callback?code=authorization-sensitive&accessToken=token-sensitive&state=state-sensitive&client_secret=client-secret-sensitive&id_token=id-token-sensitive&token=generic-token-sensitive&visible=retained"
   );
   const redactedHeaders = redactRequestHeaders({
     authorization: "Bearer authorization-sensitive",
+    "x-line-signature": "line-signature-sensitive",
     "x-ghl-signature": "signature-sensitive",
-    "x-wh-signature": "legacy-signature-sensitive"
+    "x-wh-signature": "legacy-signature-sensitive",
+    "x-wincrm-webhook-secret": "workflow-secret-sensitive",
+    "x-webhook-secret": "legacy-webhook-secret-sensitive",
+    "x-provider-secret": "provider-secret-sensitive",
+    "x-ghl-secret": "ghl-secret-sensitive",
+    "x-custom-customer-header": "customer-header-sensitive"
   });
   const serialized = JSON.stringify({ redactedUrl, redactedHeaders });
 
-  assert.doesNotMatch(serialized, /authorization-sensitive|token-sensitive|signature-sensitive/);
-  assert.match(serialized, /\[redacted\]/);
+  assert.doesNotMatch(
+    serialized,
+    /authorization-sensitive|token-sensitive|state-sensitive|client-secret-sensitive|id-token-sensitive|signature-sensitive|workflow-secret-sensitive|legacy-webhook-secret-sensitive|provider-secret-sensitive|ghl-secret-sensitive|customer-header-sensitive/
+  );
+  assert.match(serialized, /%5Bredacted%5D/);
+  assert.match(redactedUrl, /visible=retained/);
+  assert.equal(redactedHeaders.authorizationPresent, true);
+  assert.equal(redactedHeaders.webhookSecretPresent, true);
+  assert.equal(redactedHeaders.providerSecretPresent, true);
+  assert.equal(redactedHeaders.signaturePresent, true);
+  assert.equal(redactedHeaders.headerCount, 9);
+});
+
+test("response logging emits only safe header metadata", () => {
+  const redactedHeaders = redactResponseHeaders({
+    "set-cookie": "session=response-cookie-sensitive; HttpOnly",
+    authorization: "Bearer response-authorization-sensitive",
+    "proxy-authorization": "Basic proxy-authorization-sensitive",
+    "x-access-token": "response-access-token-sensitive",
+    "x-refresh-token": "response-refresh-token-sensitive",
+    "x-wincrm-webhook-secret": "response-workflow-secret-sensitive",
+    "x-webhook-secret": "response-legacy-webhook-secret-sensitive",
+    "x-provider-secret": "response-provider-secret-sensitive",
+    "x-ghl-secret": "response-ghl-secret-sensitive",
+    "x-line-signature": "response-line-signature-sensitive",
+    "x-ghl-signature": "response-ghl-signature-sensitive",
+    "x-wh-signature": "response-wh-signature-sensitive",
+    location: "/oauth/callback?state=location-state-sensitive&client_secret=location-client-secret-sensitive&visible=retained",
+    "content-type": "application/json; customer=response-content-type-sensitive",
+    "x-customer-data": "response-customer-header-sensitive"
+  });
+  const serialized = JSON.stringify(redactedHeaders);
+
+  assert.doesNotMatch(
+    serialized,
+    /response-cookie-sensitive|response-authorization-sensitive|proxy-authorization-sensitive|response-access-token-sensitive|response-refresh-token-sensitive|response-workflow-secret-sensitive|response-legacy-webhook-secret-sensitive|response-provider-secret-sensitive|response-ghl-secret-sensitive|response-line-signature-sensitive|response-wh-signature-sensitive|location-state-sensitive|location-client-secret-sensitive|response-content-type-sensitive|response-customer-header-sensitive/
+  );
+  assert.equal(redactedHeaders.headerCount, 15);
+  assert.equal(redactedHeaders.locationPresent, true);
+  assert.equal(redactedHeaders.setCookiePresent, true);
+  assert.equal(redactedHeaders.authorizationPresent, true);
+  assert.equal(redactedHeaders.accessTokenPresent, true);
+  assert.equal(redactedHeaders.refreshTokenPresent, true);
+  assert.equal(redactedHeaders.webhookSecretPresent, true);
+  assert.equal(redactedHeaders.providerSecretPresent, true);
+  assert.equal(redactedHeaders.signaturePresent, true);
 });
 
 test("direct Location OAuth creates the exact unknown tenant and token without GHL_LOCATION_ID", async () => {
