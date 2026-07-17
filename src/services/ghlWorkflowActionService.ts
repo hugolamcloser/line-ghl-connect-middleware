@@ -7,9 +7,12 @@ import {
 } from "../integrations/ghlWorkflowOutboundMirrorClient";
 import {
   LineApiError,
+  lineMaxMessagesPerPush,
   pushLineImageMessage,
+  pushLineMessages,
   pushLineTextMessage,
   type LineApiErrorCategory,
+  type LinePushMessage,
   type LinePushMessageResult
 } from "../integrations/lineClient";
 import {
@@ -27,6 +30,7 @@ import {
 import {
   buildWorkflowLineMessage,
   WorkflowLineMessageValidationError,
+  type WorkflowLineAttachmentMessage,
   type WorkflowLineMessage,
   type WorkflowLineMessageInputPresence
 } from "./workflowLineMessageBuilder";
@@ -89,6 +93,18 @@ function buildWorkflowInputLogMetadata(payload: Record<string, unknown>): Record
     ...buildMessageLogMetadata(message),
     originalImageUrlPresent: hasLogValue(getWorkflowActionField(payload, "originalImageUrl")),
     previewImageUrlPresent: hasLogValue(getWorkflowActionField(payload, "previewImageUrl"))
+  };
+}
+
+function buildAttachmentLogMetadata(message: WorkflowLineMessage): Record<string, unknown> {
+  if (message.type !== "attachments") {
+    return {};
+  }
+
+  return {
+    selectedMessageType: "attachments",
+    textPresent: Boolean(message.text),
+    ...message.attachmentSummary
   };
 }
 
@@ -159,6 +175,17 @@ function buildImageAttemptExternalMessageId(requestId: string | undefined): stri
 
   const digest = crypto.createHash("sha256").update(normalizedRequestId).digest("hex").slice(0, 32);
   return `workflow-image-attempt:${digest}`;
+}
+
+function buildAttachmentAttemptExternalMessageId(requestId: string | undefined): string | undefined {
+  const normalizedRequestId = requestId?.trim();
+
+  if (!normalizedRequestId) {
+    return undefined;
+  }
+
+  const digest = crypto.createHash("sha256").update(normalizedRequestId).digest("hex").slice(0, 32);
+  return `workflow-attachment-attempt:${digest}`;
 }
 
 function buildImageSuccessExternalMessageId(
@@ -270,6 +297,79 @@ async function persistWorkflowImageAudit(input: {
 
     return "failed";
   }
+}
+
+async function persistWorkflowAttachmentAudit(input: {
+  requestId?: string;
+  locationId: string;
+  mapping: LineProfileRecord;
+  externalMessageId?: string;
+  payload: Record<string, unknown>;
+  status: "sent" | "failed";
+  errorMessage?: string;
+  requestPayload: Record<string, unknown>;
+  dispatchStatus: "sent" | "failed" | "partial_failure" | "not_attempted";
+  lineHttpStatusCode?: number;
+}): Promise<"stored" | "failed"> {
+  try {
+    await saveMessageEvent({
+      tenantId: input.mapping.tenant_id,
+      provider: "line",
+      direction: "outbound",
+      externalMessageId: input.externalMessageId,
+      lineUserId: input.mapping.line_user_id,
+      ghlConversationId: input.mapping.ghl_conversation_id ?? undefined,
+      payload: input.payload,
+      status: input.status,
+      errorMessage: input.errorMessage,
+      requestPayload: input.requestPayload
+    });
+
+    return "stored";
+  } catch {
+    logger.error(
+      {
+        ...buildWorkflowIdentifierLogContext({
+          requestId: input.requestId,
+          locationId: input.locationId,
+          mapping: input.mapping
+        }),
+        selectedMessageType: "attachments",
+        dispatchStatus: input.dispatchStatus,
+        lineHttpStatusCode: input.lineHttpStatusCode,
+        auditPersistenceStatus: "failed"
+      },
+      "Failed to persist GHL workflow LINE attachment audit event"
+    );
+
+    return "failed";
+  }
+}
+
+function buildAttachmentLineMessages(message: WorkflowLineAttachmentMessage): LinePushMessage[] {
+  const messages: LinePushMessage[] = [];
+
+  if (message.text) {
+    messages.push({ type: "text", text: message.text });
+  }
+
+  for (const attachment of message.attachments) {
+    if (attachment.category === "native_image") {
+      messages.push({
+        type: "image",
+        originalContentUrl: attachment.url,
+        previewImageUrl: attachment.url
+      });
+      continue;
+    }
+
+    messages.push({
+      type: "text",
+      text: `${attachment.displayName}\n${attachment.url}`
+    });
+  }
+
+  return messages;
 }
 
 function stringifyForStorage(value: unknown): string | undefined {
@@ -459,6 +559,257 @@ async function resolveLineProfileByLocationAndGhlContact(
   return { tenantIds, mapping };
 }
 
+async function deliverWorkflowAttachments(input: {
+  context: WorkflowSendLineContext;
+  locationId: string;
+  contactId: string;
+  workflowId?: string;
+  mapping: LineProfileRecord;
+  message: WorkflowLineAttachmentMessage;
+  eventPayload: Record<string, unknown>;
+  inputLogMetadata: Record<string, unknown>;
+}): Promise<WorkflowSendLineResult> {
+  const lineMessages = buildAttachmentLineMessages(input.message);
+  const batchCount = Math.ceil(lineMessages.length / lineMaxMessagesPerPush);
+  const attemptExternalMessageId = buildAttachmentAttemptExternalMessageId(input.context.requestId);
+  const sanitizedPayload = {
+    ...input.eventPayload,
+    textPresent: Boolean(input.message.text),
+    ...input.message.attachmentSummary
+  };
+  let lineChannelSelection: LineChannelSelection;
+
+  try {
+    lineChannelSelection = await resolveLineChannelForOutbound(input.mapping.tenant_id, input.mapping);
+  } catch (error) {
+    const isDisconnected = isLineChannelNotConnectedError(error);
+    const errorMessage = isDisconnected ? error.message : "LINE attachment channel resolution failed";
+    const requestPayload = {
+      ...input.eventPayload,
+      source: "ghl_workflow_attachments_direct",
+      tenantId: input.mapping.tenant_id,
+      lineChannelId: isDisconnected
+        ? error.lineChannelId ?? input.mapping.line_channel_id ?? null
+        : input.mapping.line_channel_id ?? null,
+      channelTokenSource: isDisconnected ? error.channelTokenSource : null,
+      channelConnected: false,
+      channelResolutionStatus: "failed",
+      dispatchStatus: "not_attempted",
+      lineResultStatus: "not_attempted",
+      lineHttpStatusCode: null,
+      mirrorResultStatus: "unsupported",
+      batchCount,
+      totalMessageCount: lineMessages.length,
+      sentBatchCount: 0,
+      sentMessageCount: 0,
+      textPresent: Boolean(input.message.text),
+      ...input.message.attachmentSummary
+    };
+    const auditPersistenceStatus = await persistWorkflowAttachmentAudit({
+      requestId: input.context.requestId,
+      locationId: input.locationId,
+      mapping: input.mapping,
+      externalMessageId: attemptExternalMessageId,
+      payload: sanitizedPayload,
+      status: "failed",
+      errorMessage,
+      requestPayload,
+      dispatchStatus: "not_attempted"
+    });
+    const logContext = {
+      ...buildWorkflowIdentifierLogContext({
+        requestId: input.context.requestId,
+        locationId: input.locationId,
+        contactId: input.contactId,
+        workflowId: input.workflowId,
+        mapping: input.mapping,
+        lineChannelId: requestPayload.lineChannelId
+      }),
+      ...input.inputLogMetadata,
+      provider: "line",
+      channelResolutionStatus: "failed",
+      channelConnected: false,
+      channelTokenSource: requestPayload.channelTokenSource,
+      dispatchStatus: "not_attempted",
+      lineResultStatus: "not_attempted",
+      lineHttpStatusCode: null,
+      mirrorResultStatus: "unsupported",
+      auditPersistenceStatus,
+      errorPresent: true,
+      errorCategory: isDisconnected ? "channel_not_connected" : "channel_resolution"
+    };
+
+    if (isDisconnected) {
+      logger.warn(logContext, "Blocked GHL workflow LINE attachments because LINE channel is not connected");
+      return buildResponse(409, "failed", errorMessage);
+    }
+
+    logger.error(logContext, "Failed to resolve LINE channel for GHL workflow attachments");
+    return buildResponse(200, "failed", errorMessage);
+  }
+
+  const lineResults: LinePushMessageResult[] = [];
+  let sentMessageCount = 0;
+
+  for (let batchIndex = 0; batchIndex < batchCount; batchIndex += 1) {
+    const batch = lineMessages.slice(
+      batchIndex * lineMaxMessagesPerPush,
+      (batchIndex + 1) * lineMaxMessagesPerPush
+    );
+
+    try {
+      const result = await pushLineMessages(
+        input.mapping.line_user_id,
+        batch,
+        lineChannelSelection.channelAccessToken
+      );
+      lineResults.push(result);
+      sentMessageCount += batch.length;
+    } catch (error) {
+      const lineError = getSafeLineErrorMetadata(error);
+      const firstLineMessageId = lineResults
+        .flatMap((result) => result.messageIds?.length ? result.messageIds : result.messageId ? [result.messageId] : [])
+        .at(0);
+      const dispatchStatus = sentMessageCount > 0 ? "partial_failure" : "failed";
+      const errorMessage = sentMessageCount > 0
+        ? "LINE attachment delivery partially failed"
+        : "LINE attachment send failed";
+      const requestPayload = {
+        ...input.eventPayload,
+        source: "ghl_workflow_attachments_direct",
+        tenantId: input.mapping.tenant_id,
+        lineChannelId: lineChannelSelection.lineChannelId ?? null,
+        channelTokenSource: lineChannelSelection.channelTokenSource,
+        channelConnected: true,
+        channelResolutionStatus: "success",
+        dispatchStatus,
+        lineResultStatus: "failed",
+        lineHttpStatusCode: lineError.statusCode ?? null,
+        lineErrorCategory: lineError.category,
+        mirrorResultStatus: "unsupported",
+        batchCount,
+        totalMessageCount: lineMessages.length,
+        sentBatchCount: lineResults.length,
+        sentMessageCount,
+        failedBatchIndex: batchIndex,
+        textPresent: Boolean(input.message.text),
+        ...input.message.attachmentSummary
+      };
+      const auditPersistenceStatus = await persistWorkflowAttachmentAudit({
+        requestId: input.context.requestId,
+        locationId: input.locationId,
+        mapping: input.mapping,
+        externalMessageId: firstLineMessageId ? `line:${firstLineMessageId}` : attemptExternalMessageId,
+        payload: sanitizedPayload,
+        status: "failed",
+        errorMessage,
+        requestPayload,
+        dispatchStatus,
+        lineHttpStatusCode: lineError.statusCode
+      });
+
+      logger.error(
+        {
+          ...buildWorkflowIdentifierLogContext({
+            requestId: input.context.requestId,
+            locationId: input.locationId,
+            contactId: input.contactId,
+            workflowId: input.workflowId,
+            mapping: input.mapping,
+            lineChannelId: lineChannelSelection.lineChannelId,
+            lineMessageId: firstLineMessageId
+          }),
+          ...input.inputLogMetadata,
+          provider: "line",
+          channelResolutionStatus: "success",
+          channelConnected: true,
+          channelTokenSource: lineChannelSelection.channelTokenSource,
+          dispatchStatus,
+          lineResultStatus: "failed",
+          lineHttpStatusCode: lineError.statusCode,
+          lineRequestIdPresent: hasLogValue(lineError.lineRequestId),
+          lineRequestRef: buildShortLogRef(lineError.lineRequestId),
+          lineErrorCategory: lineError.category,
+          mirrorResultStatus: "unsupported",
+          auditPersistenceStatus,
+          batchCount,
+          sentBatchCount: lineResults.length,
+          sentMessageCount
+        },
+        "LINE attachment workflow delivery failed"
+      );
+
+      return buildResponse(200, "failed", errorMessage, firstLineMessageId ?? null);
+    }
+  }
+
+  const messageIds = lineResults.flatMap((result) =>
+    result.messageIds?.length ? result.messageIds : result.messageId ? [result.messageId] : []
+  );
+  const firstLineMessageId = messageIds[0];
+  const lastLineResult = lineResults.at(-1);
+  const requestPayload = {
+    ...input.eventPayload,
+    source: "ghl_workflow_attachments_direct",
+    tenantId: input.mapping.tenant_id,
+    lineChannelId: lineChannelSelection.lineChannelId ?? null,
+    channelTokenSource: lineChannelSelection.channelTokenSource,
+    channelConnected: true,
+    channelResolutionStatus: "success",
+    dispatchStatus: "sent",
+    lineResultStatus: "sent",
+    lineHttpStatusCode: lastLineResult?.statusCode ?? null,
+    mirrorResultStatus: "unsupported",
+    batchCount,
+    totalMessageCount: lineMessages.length,
+    sentBatchCount: lineResults.length,
+    sentMessageCount,
+    textPresent: Boolean(input.message.text),
+    ...input.message.attachmentSummary
+  };
+  const auditPersistenceStatus = await persistWorkflowAttachmentAudit({
+    requestId: input.context.requestId,
+    locationId: input.locationId,
+    mapping: input.mapping,
+    externalMessageId: firstLineMessageId ? `line:${firstLineMessageId}` : attemptExternalMessageId,
+    payload: sanitizedPayload,
+    status: "sent",
+    requestPayload,
+    dispatchStatus: "sent",
+    lineHttpStatusCode: lastLineResult?.statusCode
+  });
+
+  logger.info(
+    {
+      ...buildWorkflowIdentifierLogContext({
+        requestId: input.context.requestId,
+        locationId: input.locationId,
+        contactId: input.contactId,
+        workflowId: input.workflowId,
+        mapping: input.mapping,
+        lineChannelId: lineChannelSelection.lineChannelId,
+        lineMessageId: firstLineMessageId
+      }),
+      ...input.inputLogMetadata,
+      provider: "line",
+      channelResolutionStatus: "success",
+      channelConnected: true,
+      channelTokenSource: lineChannelSelection.channelTokenSource,
+      dispatchStatus: "sent",
+      lineResultStatus: "sent",
+      lineHttpStatusCode: lastLineResult?.statusCode,
+      mirrorResultStatus: "unsupported",
+      auditPersistenceStatus,
+      batchCount,
+      sentBatchCount: lineResults.length,
+      sentMessageCount
+    },
+    "GHL workflow LINE attachments sent without Inbox mirroring"
+  );
+
+  return buildResponse(200, "sent", "", firstLineMessageId ?? null);
+}
+
 export async function processGhlWorkflowSendLine(
   payload: Record<string, unknown>,
   context: WorkflowSendLineContext = {}
@@ -471,7 +822,7 @@ export async function processGhlWorkflowSendLine(
   const workflowId = getWorkflowContextString(payload, extras, "workflowId");
   const metaKey = getString(meta.key);
   const metaVersion = getString(meta.version);
-  const inputLogMetadata = buildWorkflowInputLogMetadata(payload);
+  let inputLogMetadata = buildWorkflowInputLogMetadata(payload);
   let workflowMessage: WorkflowLineMessage;
 
   try {
@@ -497,6 +848,11 @@ export async function processGhlWorkflowSendLine(
 
     return buildResponse(400, "failed", error.message);
   }
+
+  inputLogMetadata = {
+    ...inputLogMetadata,
+    ...buildAttachmentLogMetadata(workflowMessage)
+  };
 
   const eventPayload = buildWorkflowEventPayload({
     locationId,
@@ -578,6 +934,19 @@ export async function processGhlWorkflowSendLine(
     );
 
     return buildResponse(200, "skipped", "No LINE mapping found for contact");
+  }
+
+  if (workflowMessage.type === "attachments") {
+    return deliverWorkflowAttachments({
+      context,
+      locationId,
+      contactId,
+      workflowId,
+      mapping,
+      message: workflowMessage,
+      eventPayload,
+      inputLogMetadata
+    });
   }
 
   if (workflowMessage.type === "image") {

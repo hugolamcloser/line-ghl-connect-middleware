@@ -6,13 +6,14 @@ const lineApiBaseUrl = "https://api.line.me";
 
 export type LinePushMessageResult = {
   messageId?: string;
+  messageIds?: string[];
   statusCode: number;
   lineRequestId?: string;
   acceptedRequestId?: string;
   acceptedByRetryKey?: boolean;
   raw?: {
     sentMessages?: Array<{
-      id?: string;
+      id?: string | number;
       quoteToken?: string;
     }>;
     [key: string]: unknown;
@@ -33,6 +34,8 @@ export type LinePushImageMessage = {
 };
 
 export type LinePushMessage = LinePushTextMessage | LinePushImageMessage;
+
+export const lineMaxMessagesPerPush = 5;
 
 export type LineApiErrorCategory =
   | "authentication"
@@ -155,6 +158,30 @@ function getHeaderValue(response: Response, headerName: string): string | undefi
   return value || undefined;
 }
 
+function normalizeLineSentMessages(value: unknown): Array<{ id: string; quoteToken?: string }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null || !("id" in entry)) {
+      return [];
+    }
+
+    const rawId = entry.id;
+    const id = typeof rawId === "string"
+      ? rawId.trim().length > 0 ? rawId : undefined
+      : typeof rawId === "number" && Number.isFinite(rawId)
+        ? String(rawId)
+        : undefined;
+    const quoteToken = "quoteToken" in entry && typeof entry.quoteToken === "string"
+      ? entry.quoteToken
+      : undefined;
+
+    return id ? [{ id, ...(quoteToken ? { quoteToken } : {}) }] : [];
+  });
+}
+
 async function getSafeAcceptedRetryData<T>(response: Response): Promise<T> {
   try {
     const body = (await response.json()) as unknown;
@@ -163,22 +190,7 @@ async function getSafeAcceptedRetryData<T>(response: Response): Promise<T> {
       return undefined as T;
     }
 
-    const sentMessages = Array.isArray(body.sentMessages)
-      ? body.sentMessages.flatMap((entry) => {
-          if (typeof entry !== "object" || entry === null || !("id" in entry)) {
-            return [];
-          }
-
-          const id = typeof entry.id === "string" || typeof entry.id === "number"
-            ? String(entry.id)
-            : undefined;
-          const quoteToken = "quoteToken" in entry && typeof entry.quoteToken === "string"
-            ? entry.quoteToken
-            : undefined;
-
-          return id ? [{ id, quoteToken }] : [];
-        })
-      : [];
+    const sentMessages = normalizeLineSentMessages(body.sentMessages);
 
     return { sentMessages } as T;
   } catch {
@@ -290,33 +302,50 @@ export async function validateLineChannelAccessToken(channelAccessToken: string)
   await getLineBotInfo(channelAccessToken);
 }
 
-async function pushLineMessage(
+export async function pushLineMessages(
   to: string,
-  message: LinePushMessage,
+  messages: LinePushMessage[],
   channelAccessToken?: string,
   retryKey?: string
 ): Promise<LinePushMessageResult> {
+  if (messages.length === 0 || messages.length > lineMaxMessagesPerPush) {
+    throw new LineApiError({ category: "invalid_request" });
+  }
+
   const result = await lineRequestWithMetadata<LinePushMessageResult["raw"] | undefined>(
     "/v2/bot/message/push",
     {
       method: "POST",
       body: JSON.stringify({
         to,
-        messages: [message]
+        messages
       })
     },
     channelAccessToken,
     { retryKey, acceptRetryConflict: true }
   );
 
+  const normalizedSentMessages = normalizeLineSentMessages(result.data?.sentMessages);
+  const messageIds = normalizedSentMessages.map(({ id }) => id);
+
   return {
-    messageId: result.data?.sentMessages?.[0]?.id,
+    messageId: messageIds[0],
+    messageIds,
     statusCode: result.statusCode,
     lineRequestId: result.lineRequestId,
     acceptedRequestId: result.acceptedRequestId,
     acceptedByRetryKey: result.acceptedByRetryKey,
     raw: result.data
   };
+}
+
+async function pushLineMessage(
+  to: string,
+  message: LinePushMessage,
+  channelAccessToken?: string,
+  retryKey?: string
+): Promise<LinePushMessageResult> {
+  return pushLineMessages(to, [message], channelAccessToken, retryKey);
 }
 
 export async function pushLineTextMessage(
