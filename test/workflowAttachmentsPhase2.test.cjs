@@ -415,6 +415,165 @@ test("signed HTTPS attachment URLs are preserved exactly for delivery", async ()
   assert.equal(flattenedMessages(calls)[0].previewImageUrl, signedUrl);
 });
 
+test("a valid Traditional Chinese attachment filename remains unchanged", async () => {
+  const calls = setupHarness();
+  const name = "最後7月場次圖.png";
+  const url = "https://media.example.test/private/traditional.png?signature=traditional-private";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url, name, size: 1_000_001 }]
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), [{ type: "text", text: `${name}\n${url}` }]);
+});
+
+test("a valid Japanese attachment filename remains unchanged", async () => {
+  const calls = setupHarness();
+  const name = "最終イベント画像.png";
+  const url = "https://media.example.test/private/japanese.png?signature=japanese-private";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url, name, size: 1_000_001 }]
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), [{ type: "text", text: `${name}\n${url}` }]);
+});
+
+test("an emoji attachment filename remains unchanged", async () => {
+  const calls = setupHarness();
+  const name = "夏祭り🎉📷.png";
+  const url = "https://media.example.test/private/emoji.png?signature=emoji-private";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url, name, size: 1_000_001 }]
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), [{ type: "text", text: `${name}\n${url}` }]);
+});
+
+test("valid Simplified Chinese and Korean filenames remain unchanged", async () => {
+  const calls = setupHarness();
+  const names = ["最终活动文件.pdf", "최종행사파일.pdf"];
+  const urls = [
+    "https://media.example.test/private/simplified.pdf?signature=simplified-private",
+    "https://media.example.test/private/korean.pdf?signature=korean-private"
+  ];
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: names.map((name, index) => ({ url: urls[index], name }))
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), names.map((name, index) => ({
+    type: "text",
+    text: `${name}\n${urls[index]}`
+  })));
+});
+
+test("common Latin-1 and Windows-1252 UTF-8 mojibake repairs to Traditional Chinese", async () => {
+  const calls = setupHarness();
+  const expectedName = "最後7月場次圖.png";
+  const latin1Mojibake = Buffer.from(expectedName, "utf8").toString("latin1");
+  const windows1252Mojibake = new TextDecoder("windows-1252").decode(Buffer.from(expectedName, "utf8"));
+  const urls = [
+    "https://media.example.test/private/latin1.png?signature=latin1-private",
+    "https://media.example.test/private/windows1252.png?signature=windows-private"
+  ];
+
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [
+      { url: urls[0], name: latin1Mojibake, size: 1_000_001 },
+      { url: urls[1], name: windows1252Mojibake, size: 1_000_001 }
+    ]
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), urls.map((url) => ({
+    type: "text",
+    text: `${expectedName}\n${url}`
+  })));
+});
+
+test("a normal ASCII attachment filename remains unchanged", async () => {
+  const calls = setupHarness();
+  const name = "quarterly-report-final.pdf";
+  const url = "https://media.example.test/private/ascii.pdf?signature=ascii-private";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url, name }]
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), [{ type: "text", text: `${name}\n${url}` }]);
+});
+
+test("an uncertain malformed image filename uses the category fallback and safe extension", async () => {
+  const calls = setupHarness();
+  const url = "https://media.example.test/private/malformed.png?signature=malformed-private";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url, name: "Ã©ÿ.png", size: 1_000_001 }]
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), [{ type: "text", text: `圖片附件.png\n${url}` }]);
+});
+
+test("uncertain malformed filenames use category-specific fallbacks", async () => {
+  const calls = setupHarness();
+  const fixtures = [
+    { extension: "mp4", label: "影片附件" },
+    { extension: "mp3", label: "音訊附件" },
+    { extension: "pdf", label: "文件附件" },
+    { extension: "bin", label: "附件" }
+  ];
+  const attachments = fixtures.map(({ extension }, index) => ({
+    url: `https://media.example.test/private/fallback-${index}?signature=fallback-private-${index}`,
+    name: `Ã©ÿ.${extension}`
+  }));
+  await workflowService.processGhlWorkflowSendLine(basePayload({ attachments }));
+
+  assert.deepEqual(flattenedMessages(calls), fixtures.map(({ extension, label }, index) => ({
+    type: "text",
+    text: `${label}.${extension}\n${attachments[index].url}`
+  })));
+});
+
+test("attachment display names remove path traversal components", async () => {
+  const calls = setupHarness();
+  const url = "https://media.example.test/private/path.png?signature=path-private";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url, name: "../../private/最後7月場次圖.png", size: 1_000_001 }]
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), [{ type: "text", text: `最後7月場次圖.png\n${url}` }]);
+});
+
+test("attachment display names remove controls and collapse excessive whitespace", async () => {
+  const calls = setupHarness();
+  const url = "https://media.example.test/private/control.pdf?signature=control-private";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url, name: "報告\u0000   \n 最終.pdf" }]
+  }));
+
+  assert.deepEqual(flattenedMessages(calls), [{ type: "text", text: `報告 最終.pdf\n${url}` }]);
+});
+
+test("attachment display names retain a safe extension within the 120-character limit", async () => {
+  const calls = setupHarness();
+  const url = "https://media.example.test/private/long.pdf?signature=long-private";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url, name: `${"🎉".repeat(130)}.pdf` }]
+  }));
+  const displayName = flattenedMessages(calls)[0].text.split("\n")[0];
+
+  assert.equal(Array.from(displayName).length, 120);
+  assert.equal(displayName.endsWith(".pdf"), true);
+  assert.doesNotMatch(displayName, /\uFFFD/);
+});
+
+test("display-name repair leaves signed attachment URLs byte-for-byte unchanged", async () => {
+  const calls = setupHarness();
+  const expectedName = "最後7月場次圖.png";
+  const mojibakeName = new TextDecoder("windows-1252").decode(Buffer.from(expectedName, "utf8"));
+  const signedUrl = "https://media.example.test/folder%20name/file.png?X-Signature=a%2Bb%2Fc%3D&expires=123";
+  await workflowService.processGhlWorkflowSendLine(basePayload({
+    attachments: [{ url: signedUrl, name: mojibakeName, size: 1_000_001 }]
+  }));
+
+  assert.equal(flattenedMessages(calls)[0].text, `${expectedName}\n${signedUrl}`);
+});
+
 test("text plus four attachments fits in exactly one LINE request", async () => {
   const calls = setupHarness();
   const attachments = Array.from({ length: 4 }, (_, index) => ({
