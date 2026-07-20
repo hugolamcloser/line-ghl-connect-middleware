@@ -52,6 +52,21 @@ export type Stage1GhlRequestResult = {
   upstreamError?: Stage1UpstreamErrorDiagnostic;
 };
 
+export type Stage1RecognizedSmsProvider = {
+  name: string;
+  type: string;
+  default: boolean;
+  matchesConfiguredStage1Provider: boolean;
+};
+
+export type Stage1ProviderCheckResult = {
+  ok: boolean;
+  statusCode: number;
+  configuredProviderMatched: boolean;
+  recognizedProviders: Stage1RecognizedSmsProvider[];
+  upstreamError?: Stage1UpstreamErrorDiagnostic;
+};
+
 const messagesEndpoint = "/conversations/messages";
 const inboundMessagesEndpoint = `${messagesEndpoint}/inbound`;
 const maxUpstreamErrorBytes = 32 * 1_024;
@@ -59,6 +74,7 @@ const maxDiagnosticTextLength = 240;
 const maxDiagnosticCodeLength = 80;
 const maxRejectedFieldLength = 120;
 const maxRejectedFields = 20;
+const maxRecognizedProviders = 50;
 const maxDiagnosticTraversalDepth = 5;
 const maxDiagnosticTraversalNodes = 100;
 const urlPattern = /https?:\/\/[^\s"'<>]+/giu;
@@ -460,6 +476,57 @@ async function parseUpstreamError(response: Response): Promise<Stage1UpstreamErr
   };
 }
 
+async function parseRecognizedSmsProviders(
+  response: Response,
+  configuredProviderId: string
+): Promise<{
+  responseParsed: boolean;
+  responseTruncated: boolean;
+  recognizedProviders: Stage1RecognizedSmsProvider[];
+}> {
+  const { text, responseTruncated } = await readBoundedResponseBody(response);
+  let parsed: unknown;
+
+  if (!text.trim() || responseTruncated) {
+    return { responseParsed: false, responseTruncated, recognizedProviders: [] };
+  }
+
+  try {
+    parsed = JSON.parse(text.replace(/^\uFEFF/u, ""));
+  } catch {
+    return { responseParsed: false, responseTruncated, recognizedProviders: [] };
+  }
+
+  const conversationChannel = getRecord(getRecord(parsed)?.conversationChannel);
+  const smsProviders = conversationChannel?.SMS;
+
+  if (!Array.isArray(smsProviders)) {
+    return { responseParsed: false, responseTruncated, recognizedProviders: [] };
+  }
+
+  const recognizedProviders: Stage1RecognizedSmsProvider[] = [];
+
+  for (const entry of smsProviders.slice(0, maxRecognizedProviders)) {
+    const provider = getRecord(getRecord(entry)?.conversationProvider);
+    const providerId = getNonEmptyString(provider?._id);
+    const name = sanitizeDiagnosticText(provider?.name, maxRejectedFieldLength);
+    const type = sanitizeDiagnosticText(provider?.type, maxDiagnosticCodeLength);
+
+    if (!providerId || !name || !type) {
+      continue;
+    }
+
+    recognizedProviders.push({
+      name,
+      type,
+      default: provider?.default === true,
+      matchesConfiguredStage1Provider: providerId === configuredProviderId
+    });
+  }
+
+  return { responseParsed: true, responseTruncated, recognizedProviders };
+}
+
 async function parseCreatedMessage(response: Response): Promise<{
   messageId?: string;
   conversationId?: string;
@@ -561,6 +628,55 @@ export async function createStage1InboundBootstrapMessage(
     ok: true,
     statusCode: response.status,
     ...ids
+  };
+}
+
+export async function checkStage1SmsConversationProvider(
+  locationId: string,
+  configuredProviderId: string
+): Promise<Stage1ProviderCheckResult> {
+  const path = `/locations/${encodeURIComponent(locationId)}/conversationChannels/SMS`;
+  const response = await requestWithOAuthRefresh(locationId, path, {
+    method: "GET",
+    headers: { Version: "v3" }
+  });
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      statusCode: response.status,
+      configuredProviderMatched: false,
+      recognizedProviders: [],
+      upstreamError: await parseUpstreamError(response)
+    };
+  }
+
+  const parsed = await parseRecognizedSmsProviders(response, configuredProviderId);
+
+  if (!parsed.responseParsed) {
+    return {
+      ok: false,
+      statusCode: response.status,
+      configuredProviderMatched: false,
+      recognizedProviders: [],
+      upstreamError: {
+        statusCode: response.status,
+        error: "Unrecognized provider response",
+        code: "PROVIDER_RESPONSE_UNRECOGNIZED",
+        rejectedFields: [],
+        responseParsed: false,
+        responseTruncated: parsed.responseTruncated
+      }
+    };
+  }
+
+  return {
+    ok: true,
+    statusCode: response.status,
+    configuredProviderMatched: parsed.recognizedProviders.some(
+      (provider) => provider.matchesConfiguredStage1Provider
+    ),
+    recognizedProviders: parsed.recognizedProviders
   };
 }
 

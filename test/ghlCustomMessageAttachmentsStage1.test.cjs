@@ -27,6 +27,7 @@ const { createApp } = require("../dist/app");
 
 const stage1Path = "/debug/ghl/custom-message-attachments-stage-1";
 const bootstrapPath = `${stage1Path}/bootstrap`;
+const providerCheckPath = `${stage1Path}/provider-check`;
 const callbackPath = "/webhooks/ghl/stage-1/custom-message-outbound";
 const probeRunIds = {
   A: "11111111-1111-4111-8111-111111111111",
@@ -176,6 +177,14 @@ async function runBootstrap(body = {}, secret = config.env.WEBHOOK_SHARED_SECRET
   return requestApp({ path: bootstrapPath, body, headers: stage1Headers(secret) });
 }
 
+async function runProviderCheck(secret = config.env.WEBHOOK_SHARED_SECRET) {
+  return requestApp({
+    path: providerCheckPath,
+    method: "GET",
+    headers: stage1Headers(secret)
+  });
+}
+
 test("Stage 1 driver rejects missing and invalid x-wincrm-webhook-secret", async () => {
   let fetchCount = 0;
   global.fetch = async () => {
@@ -190,11 +199,15 @@ test("Stage 1 driver rejects missing and invalid x-wincrm-webhook-secret", async
   const invalid = await runProbe({ probeRunId: probeRunIds.A, case: "A" }, "invalid-secret");
   const missingBootstrap = await requestApp({ path: bootstrapPath, body: {} });
   const invalidBootstrap = await runBootstrap({}, "invalid-secret");
+  const missingProviderCheck = await requestApp({ path: providerCheckPath, method: "GET" });
+  const invalidProviderCheck = await runProviderCheck("invalid-secret");
 
   assert.equal(missing.status, 401);
   assert.equal(invalid.status, 401);
   assert.equal(missingBootstrap.status, 401);
   assert.equal(invalidBootstrap.status, 401);
+  assert.equal(missingProviderCheck.status, 401);
+  assert.equal(invalidProviderCheck.status, 401);
   assert.equal(fetchCount, 0);
 });
 
@@ -229,6 +242,246 @@ test("Stage 1 API version defaults to v3 independently of production GHL_API_VER
   assert.equal(config.env.STAGE1_GHL_API_VERSION, "v3");
   assert.equal(requests[0].init.headers.Version, "v3");
   assert.ok(Object.prototype.hasOwnProperty.call(presence.optional, "STAGE1_GHL_API_VERSION"));
+});
+
+test("Stage 1 provider check uses exact-location OAuth, Version v3, and returns a sanitized match", async () => {
+  config.env.STAGE1_GHL_API_VERSION = "2021-07-28";
+  const { authCalls } = setupOAuth();
+  const requests = [];
+  const logCalls = [];
+  let productionCallbackCalls = 0;
+  let productionWorkflowCalls = 0;
+  let lineCalls = 0;
+
+  loggerModule.logger.info = (...args) => logCalls.push(args);
+  productionCallbackService.processGhlOutboundWebhook = async () => {
+    productionCallbackCalls += 1;
+  };
+  productionWorkflowService.processGhlWorkflowSendLine = async () => {
+    productionWorkflowCalls += 1;
+  };
+  for (const key of ["pushLineTextMessage", "pushLineImageMessage", "pushLineMessages"]) {
+    lineClient[key] = async () => {
+      lineCalls += 1;
+    };
+  }
+  global.fetch = async (url, init) => {
+    requests.push({ url, init });
+    return new Response(JSON.stringify({
+      conversationChannel: {
+        SMS: [
+          {
+            conversationProvider: {
+              _id: config.env.STAGE1_GHL_PROVIDER_ID,
+              name: "Stage 1 SMS",
+              type: "SMS",
+              default: false
+            }
+          },
+          {
+            conversationProvider: {
+              _id: "other-provider-sensitive",
+              name: "Other SMS",
+              type: "SMS",
+              default: true
+            }
+          }
+        ]
+      },
+      ignoredLocationId: config.env.STAGE1_GHL_LOCATION_ID,
+      ignoredContactId: config.env.STAGE1_GHL_CONTACT_ID
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  const response = await runProviderCheck();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, {
+    ok: true,
+    highLevelHttpStatus: 200,
+    configuredProviderMatched: true,
+    configuredProviderExpectedType: "SMS",
+    recognizedSmsProviderCount: 2,
+    recognizedProviders: [
+      {
+        name: "Stage 1 SMS",
+        type: "SMS",
+        default: false,
+        matchesConfiguredStage1Provider: true
+      },
+      {
+        name: "Other SMS",
+        type: "SMS",
+        default: true,
+        matchesConfiguredStage1Provider: false
+      }
+    ]
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(
+    requests[0].url,
+    `https://services.leadconnectorhq.com/locations/${encodeURIComponent(config.env.STAGE1_GHL_LOCATION_ID)}/conversationChannels/SMS`
+  );
+  assert.equal(requests[0].init.method, "GET");
+  assert.equal(requests[0].init.body, undefined);
+  assert.equal(requests[0].init.headers.Version, "v3");
+  assert.equal(authCalls.length, 1);
+  assert.equal(authCalls[0].locationId, config.env.STAGE1_GHL_LOCATION_ID);
+  assert.deepEqual(authCalls[0].options, { allowPrivateFallback: false });
+  assert.equal(productionCallbackCalls, 0);
+  assert.equal(productionWorkflowCalls, 0);
+  assert.equal(lineCalls, 0);
+
+  const exposed = JSON.stringify({ response: response.body, logs: logCalls });
+  assert.doesNotMatch(
+    exposed,
+    /stage1-location-sensitive|stage1-contact-sensitive|stage1-provider-sensitive|other-provider-sensitive|stage1-shared-secret-sensitive|stage1-oauth-token-sensitive/
+  );
+  assert.match(exposed, /Stage 1 SMS|Other SMS|recognizedSmsProviderCount|configuredProviderMatched/);
+});
+
+test("Stage 1 provider check reports a sanitized non-match", async () => {
+  setupOAuth();
+  global.fetch = async () => new Response(JSON.stringify({
+    conversationChannel: {
+      SMS: [
+        {
+          conversationProvider: {
+            _id: "different-provider-sensitive",
+            name: "Different SMS",
+            type: "SMS",
+            default: false
+          }
+        }
+      ]
+    }
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" }
+  });
+
+  const response = await runProviderCheck();
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.configuredProviderMatched, false);
+  assert.equal(response.body.recognizedSmsProviderCount, 1);
+  assert.deepEqual(response.body.recognizedProviders, [
+    {
+      name: "Different SMS",
+      type: "SMS",
+      default: false,
+      matchesConfiguredStage1Provider: false
+    }
+  ]);
+  assert.doesNotMatch(JSON.stringify(response.body), /different-provider-sensitive|stage1-provider-sensitive/);
+});
+
+test("Stage 1 provider check refreshes exact-location OAuth once after a 401", async () => {
+  const { authCalls, refreshCalls } = setupOAuth();
+  const requests = [];
+
+  global.fetch = async (url, init) => {
+    requests.push({ url, init });
+
+    if (requests.length === 1) {
+      return new Response(JSON.stringify({ message: "expired token-sensitive response" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    return new Response(JSON.stringify({
+      conversationChannel: {
+        SMS: [
+          {
+            conversationProvider: {
+              _id: config.env.STAGE1_GHL_PROVIDER_ID,
+              name: "Stage 1 SMS",
+              type: "SMS",
+              default: false
+            }
+          }
+        ]
+      }
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  const response = await runProviderCheck();
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.configuredProviderMatched, true);
+  assert.equal(requests.length, 2);
+  assert.equal(authCalls.length, 1);
+  assert.deepEqual(refreshCalls, [config.env.STAGE1_GHL_LOCATION_ID]);
+  assert.match(requests[0].init.headers.Authorization, /stage1-oauth-token-sensitive/);
+  assert.match(requests[1].init.headers.Authorization, /stage1-refreshed-token-sensitive/);
+});
+
+test("Stage 1 provider check sanitizes 400, final 401, and 500 responses", async () => {
+  for (const status of [400, 401, 500]) {
+    const { refreshCalls } = setupOAuth();
+    const logCalls = [];
+    let requestCount = 0;
+    loggerModule.logger.info = (...args) => logCalls.push(args);
+    global.fetch = async () => {
+      requestCount += 1;
+      return new Response(JSON.stringify({
+        status: "Rejected",
+        error: "Provider lookup failed",
+        message: `Location ${config.env.STAGE1_GHL_LOCATION_ID} provider ${config.env.STAGE1_GHL_PROVIDER_ID} ${assetUrls.image}`,
+        code: `LOOKUP_${status}`,
+        validationErrors: [
+          {
+            field: "conversationProviderId",
+            message: `Invalid ${config.env.STAGE1_GHL_PROVIDER_ID}`,
+            code: "invalid_provider"
+          }
+        ],
+        authorization: "Bearer upstream-token-sensitive",
+        unknown: "must-not-be-returned"
+      }), {
+        status,
+        headers: { "Content-Type": "application/json" }
+      });
+    };
+
+    const response = await runProviderCheck();
+    const exposed = JSON.stringify({ response: response.body, logs: logCalls });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, false);
+    assert.equal(response.body.highLevelHttpStatus, status);
+    assert.equal(response.body.configuredProviderMatched, false);
+    assert.equal(response.body.recognizedSmsProviderCount, 0);
+    assert.deepEqual(response.body.recognizedProviders, []);
+    assert.equal(response.body.upstreamError.statusCode, status);
+    assert.equal(response.body.upstreamError.code, `LOOKUP_${status}`);
+    assert.equal(response.body.upstreamError.responseParsed, true);
+    assert.equal(response.body.upstreamError.responseTruncated, false);
+    assert.deepEqual(response.body.upstreamError.rejectedFields, [
+      {
+        field: "conversationProviderId",
+        message: "Invalid [redacted]",
+        code: "invalid_provider"
+      }
+    ]);
+    assert.equal(requestCount, status === 401 ? 2 : 1);
+    assert.equal(refreshCalls.length, status === 401 ? 1 : 0);
+    assert.doesNotMatch(
+      exposed,
+      /stage1-location-sensitive|stage1-contact-sensitive|stage1-provider-sensitive|signed-image-sensitive|upstream-token-sensitive|stage1-shared-secret-sensitive|stage1-oauth-token-sensitive|https:\/\//
+    );
+    assert.doesNotMatch(JSON.stringify(logCalls), /Provider lookup failed|Location |Invalid \[redacted\]|Rejected/);
+    assert.match(JSON.stringify(logCalls), new RegExp(`LOOKUP_${status}|upstream_error|validation_error`));
+  }
 });
 
 test("Stage 1 bootstrap creates the exact isolated inbound SMS payload without production or LINE calls", async () => {
@@ -421,11 +674,14 @@ test("Stage 1 routes fail closed when dedicated configuration is incomplete", as
 
   const response = await runProbe({ probeRunId: probeRunIds.A, case: "A" });
   const bootstrapResponse = await runBootstrap();
+  const providerCheckResponse = await runProviderCheck();
 
   assert.equal(response.status, 503);
   assert.equal(response.body.error, "Stage 1 HighLevel probe configuration is incomplete");
   assert.equal(bootstrapResponse.status, 503);
   assert.equal(bootstrapResponse.body.error, "Stage 1 HighLevel probe configuration is incomplete");
+  assert.equal(providerCheckResponse.status, 503);
+  assert.equal(providerCheckResponse.body.error, "Stage 1 HighLevel probe configuration is incomplete");
   assert.equal(fetchCount, 0);
 });
 

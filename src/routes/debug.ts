@@ -28,6 +28,7 @@ import {
 } from "../services/ghlOAuthService";
 import {
   bootstrapStage1ProviderContact,
+  checkStage1SmsProviderVisibility,
   getStage1ProbeObservations,
   runStage1CustomMessageProbe,
   updateStage1MessageStatus
@@ -70,6 +71,18 @@ debugRouter.post(
     try {
       stage1BootstrapInputSchema.parse(req.body ?? {});
       res.json(await bootstrapStage1ProviderContact());
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+debugRouter.get(
+  "/debug/ghl/custom-message-attachments-stage-1/provider-check",
+  requireWinCrmWebhookSecret,
+  async (_req, res, next) => {
+    try {
+      res.json(await checkStage1SmsProviderVisibility());
     } catch (error) {
       next(error);
     }

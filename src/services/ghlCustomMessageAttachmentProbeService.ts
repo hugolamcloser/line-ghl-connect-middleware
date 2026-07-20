@@ -3,6 +3,7 @@ import { isIP } from "node:net";
 import { env } from "../config/env";
 import { logger } from "../config/logger";
 import {
+  checkStage1SmsConversationProvider,
   createStage1InboundBootstrapMessage,
   createStage1CustomMessage,
   updateStage1CustomMessageStatus,
@@ -528,6 +529,51 @@ function toSafeUpstreamErrorLog(error: Stage1UpstreamErrorDiagnostic | undefined
     errorCategory: error.rejectedFields.length > 0 ? "validation_error" : "upstream_error",
     ...(error.code ? { errorCode: error.code } : {}),
     rejectedFields: error.rejectedFields.map((item) => item.field)
+  };
+}
+
+function toSafeProviderCheckErrorLog(error: Stage1UpstreamErrorDiagnostic | undefined) {
+  if (!error) {
+    return undefined;
+  }
+
+  return {
+    errorCategory: error.rejectedFields.length > 0 ? "validation_error" : "upstream_error",
+    ...(error.code ? { errorCode: error.code } : {})
+  };
+}
+
+export async function checkStage1SmsProviderVisibility() {
+  const config = requireStage1Config();
+  const result = await checkStage1SmsConversationProvider(config.locationId, config.providerId);
+  const recognizedProviders = result.recognizedProviders.map((provider) => ({
+    name: provider.name,
+    type: provider.type,
+    default: provider.default,
+    matchesConfiguredStage1Provider: provider.matchesConfiguredStage1Provider
+  }));
+
+  logger.info(
+    {
+      highLevelHttpStatus: result.statusCode,
+      recognizedSmsProviderCount: recognizedProviders.length,
+      configuredProviderMatched: result.configuredProviderMatched,
+      providerNames: recognizedProviders.map((provider) => provider.name),
+      providerTypes: recognizedProviders.map((provider) => provider.type),
+      providerDefaultFlags: recognizedProviders.map((provider) => provider.default),
+      upstreamError: toSafeProviderCheckErrorLog(result.upstreamError)
+    },
+    "Stage 1 SMS conversation-provider visibility check completed"
+  );
+
+  return {
+    ok: result.ok,
+    highLevelHttpStatus: result.statusCode,
+    configuredProviderMatched: result.configuredProviderMatched,
+    configuredProviderExpectedType: "SMS" as const,
+    recognizedSmsProviderCount: recognizedProviders.length,
+    recognizedProviders,
+    ...(result.upstreamError ? { upstreamError: result.upstreamError } : {})
   };
 }
 
