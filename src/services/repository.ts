@@ -86,6 +86,16 @@ export type WorkflowOutboundMirrorEventRecord = {
   created_at: string;
 };
 
+export type WorkflowProviderDispatchEventRecord = {
+  id: string;
+  tenant_id: string;
+  line_user_id: string | null;
+  ghl_message_id: string | null;
+  ghl_conversation_id: string | null;
+  request_payload: unknown;
+  created_at: string;
+};
+
 export type GhlOutboundProviderDeliveryClaimResult =
   | {
       claimed: true;
@@ -233,6 +243,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isWorkflowOutboundMirrorRequestPayload(value: unknown): boolean {
   return isRecord(value) && value.source === "ghl_workflow_outbound_mirror";
+}
+
+function isWorkflowProviderDispatchRequestPayload(value: unknown): boolean {
+  return isRecord(value) && value.source === "ghl_workflow_provider_dispatch";
 }
 
 async function findCanonicalLineProfileByLineUser(
@@ -1182,6 +1196,69 @@ export async function findWorkflowOutboundMirrorMessageEventForTenantIds(input: 
   const record = data as WorkflowOutboundMirrorEventRecord | null;
 
   if (!record || !isWorkflowOutboundMirrorRequestPayload(record.request_payload)) {
+    return null;
+  }
+
+  return record;
+}
+
+export async function findWorkflowProviderDispatchMessageEvent(input: {
+  tenantId: string;
+  ghlMessageId: string;
+  lineUserId: string;
+  ghlContactId?: string;
+  ghlConversationId?: string;
+}): Promise<WorkflowProviderDispatchEventRecord | null> {
+  const tenantId = input.tenantId.trim();
+  const ghlMessageId = input.ghlMessageId.trim();
+  const lineUserId = input.lineUserId.trim();
+  const ghlContactId = input.ghlContactId?.trim();
+  const ghlConversationId = input.ghlConversationId?.trim();
+
+  if (!tenantId || !ghlMessageId || !lineUserId) {
+    return null;
+  }
+
+  const supabase = getSupabase();
+  let query = supabase
+    .from("message_events")
+    .select(
+      "id, tenant_id, line_user_id, ghl_message_id, ghl_conversation_id, request_payload, created_at"
+    )
+    .eq("tenant_id", tenantId)
+    .eq("provider", "ghl")
+    .eq("direction", "outbound")
+    .eq("status", "success")
+    .eq("ghl_message_id", ghlMessageId)
+    .eq("line_user_id", lineUserId)
+    .contains("request_payload", {
+      source: "ghl_workflow_provider_dispatch",
+      ...(ghlContactId ? { contactId: ghlContactId } : {})
+    });
+
+  if (ghlConversationId) {
+    query = query.eq("ghl_conversation_id", ghlConversationId);
+  }
+
+  const { data, error } = await query
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const record = data as WorkflowProviderDispatchEventRecord | null;
+
+  if (
+    !record ||
+    record.tenant_id !== tenantId ||
+    record.ghl_message_id !== ghlMessageId ||
+    record.line_user_id !== lineUserId ||
+    (ghlConversationId && record.ghl_conversation_id !== ghlConversationId) ||
+    !isWorkflowProviderDispatchRequestPayload(record.request_payload)
+  ) {
     return null;
   }
 

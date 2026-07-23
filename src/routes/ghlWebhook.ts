@@ -2,8 +2,10 @@ import crypto from "node:crypto";
 import { Router } from "express";
 import { env } from "../config/env";
 import { HttpError } from "../middleware/errors";
+import { verifyGhlWebhookSignature } from "../middleware/ghlWebhookSignature";
 import { processGhlOutboundWebhook } from "../services/ghlSyncService";
 import { processGhlWorkflowSendLine, type WorkflowSendLineResponse } from "../services/ghlWorkflowActionService";
+import type { RawBodyRequest } from "../types/http";
 
 export const ghlWebhookRouter = Router();
 
@@ -77,8 +79,19 @@ ghlWebhookRouter.post("/webhooks/ghl/workflows/send-line", async (req, res, next
 
 ghlWebhookRouter.post(
   ["/webhooks/ghl", "/webhooks/ghl/outbound", "/webhooks/ghl/line/outbound"],
-  async (req, res, next) => {
+  async (req: RawBodyRequest, res, next) => {
     try {
+      if (!req.rawBody) {
+        throw new HttpError(400, "Raw provider callback body is required");
+      }
+
+      if (!verifyGhlWebhookSignature({
+        rawBody: req.rawBody,
+        ghlSignature: req.header("x-ghl-signature") ?? undefined
+      })) {
+        throw new HttpError(401, "Invalid HighLevel provider callback signature");
+      }
+
       validateProviderSecret(req.header("x-provider-secret") ?? req.header("x-ghl-secret"));
 
       if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {

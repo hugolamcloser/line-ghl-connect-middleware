@@ -5,9 +5,12 @@ process.env.NODE_ENV = "test";
 process.env.LOG_LEVEL = "silent";
 process.env.SUPABASE_URL = "https://example.supabase.co";
 process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-role";
-process.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "provider_first";
+process.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "direct_legacy";
+process.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST =
+  "tenant_phase_2_sensitive,tenant_channel_token_sensitive,tenant_channel_token";
 
 const repository = require("../dist/services/repository");
+const config = require("../dist/config/env");
 const workflowOutboundClient = require("../dist/integrations/ghlWorkflowOutboundMirrorClient");
 const lineClient = require("../dist/integrations/lineClient");
 const lineOutboundChannelService = require("../dist/services/lineOutboundChannelService");
@@ -21,6 +24,7 @@ const patchedExports = [
   [repository, "getTenantById"],
   [repository, "saveMessageEvent"],
   [workflowOutboundClient, "mirrorWorkflowOutboundMessageToGhl"],
+  [workflowOutboundClient, "createWorkflowProviderMessage"],
   [lineOutboundChannelService, "resolveLineChannelForOutbound"],
   [lineClient, "pushLineMessages"],
   [lineClient, "pushLineImageMessage"],
@@ -37,6 +41,7 @@ afterEach(() => {
   }
 
   global.fetch = originalFetch;
+  config.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "direct_legacy";
 });
 
 function basePayload(overrides = {}) {
@@ -97,7 +102,7 @@ function setupHarness() {
       channelTokenSource: "profile_channel"
     };
   };
-  workflowOutboundClient.mirrorWorkflowOutboundMessageToGhl = async (input) => {
+  workflowOutboundClient.createWorkflowProviderMessage = async (input) => {
     calls.providerDispatches.push(input);
     return {
       ok: true,
@@ -109,7 +114,7 @@ function setupHarness() {
         type: "Custom",
         contactId: input.contactId,
         message: input.message,
-        status: "delivered",
+        status: "pending",
         conversationProviderId: input.conversationProviderId
       },
       ghlMessageId: "ghl_message_phase_2_sensitive",
@@ -168,6 +173,7 @@ test("empty message and no attachments is rejected", async () => {
 });
 
 test("text-only request still uses the provider-first path", async () => {
+  config.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "provider_first";
   const calls = setupHarness();
   const result = await workflowService.processGhlWorkflowSendLine(basePayload({ message: "phase two text" }));
 
@@ -359,6 +365,7 @@ test("attachment at the top level is accepted", async () => {
 });
 
 test("an empty attachment string is ignored and text remains provider-first", async () => {
+  config.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "provider_first";
   const calls = setupHarness();
   const result = await workflowService.processGhlWorkflowSendLine(basePayload({
     message: "text with blank attachment default",
@@ -735,6 +742,7 @@ test("LINE sent message IDs normalize numeric values consistently for success an
 });
 
 test("legacy Phase 1 text output remains unchanged", async () => {
+  config.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "provider_first";
   const calls = setupHarness();
   const result = await workflowService.processGhlWorkflowSendLine(basePayload({ message: "legacy unchanged" }));
 

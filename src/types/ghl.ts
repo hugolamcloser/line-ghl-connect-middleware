@@ -35,7 +35,8 @@ export type NormalizedGhlOutboundMessage = {
   locationId?: string;
   conversationId?: string;
   messageId?: string;
-  message: string;
-  attachments: string[];
+  conversationProviderId?: string;
+  message?: string;
+  attachments: unknown[];
   raw: Record<string, unknown>;
 };

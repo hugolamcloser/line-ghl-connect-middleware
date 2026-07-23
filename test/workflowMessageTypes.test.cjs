@@ -7,6 +7,8 @@ process.env.LOG_LEVEL = "silent";
 process.env.SUPABASE_URL = "https://example.supabase.co";
 process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-role";
 process.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "provider_first";
+process.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST =
+  "tenant_exact,tenant_sensitive,tenant_channel_token";
 
 const config = require("../dist/config/env");
 const loggerModule = require("../dist/config/logger");
@@ -24,6 +26,7 @@ const patchedExports = [
   [repository, "getTenantById"],
   [repository, "saveMessageEvent"],
   [workflowOutboundClient, "mirrorWorkflowOutboundMessageToGhl"],
+  [workflowOutboundClient, "createWorkflowProviderMessage"],
   [ghlOAuthService, "getGhlAuthContext"],
   [ghlOAuthService, "forceRefreshGhlAuthContext"],
   [lineOutboundChannelService, "resolveLineChannelForOutbound"],
@@ -119,7 +122,7 @@ function setupHarness() {
       channelTokenSource: "profile_channel"
     };
   };
-  workflowOutboundClient.mirrorWorkflowOutboundMessageToGhl = async (input) => {
+  workflowOutboundClient.createWorkflowProviderMessage = async (input) => {
     calls.providerDispatches.push(input);
     return {
       ok: true,
@@ -131,7 +134,7 @@ function setupHarness() {
         type: "Custom",
         contactId: input.contactId,
         message: input.message,
-        status: "delivered",
+        status: "pending",
         conversationProviderId: input.conversationProviderId
       },
       ghlMessageId: "ghl_message_exact",
@@ -205,8 +208,8 @@ test("explicit text request retains the exact existing outbound message", async 
     contactId: "contact_exact",
     message: "explicit workflow reply",
     conversationProviderId: "provider_exact",
+    attachments: [],
     workflowId: "workflow_exact",
-    lineMessageId: null,
     existingGhlConversationId: "conversation_exact"
   });
   assert.equal(calls.imagePushes.length, 0);

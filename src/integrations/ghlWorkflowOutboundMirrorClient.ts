@@ -12,6 +12,15 @@ type GhlWorkflowOutboundMirrorPayload = {
   conversationProviderId?: string;
 };
 
+type GhlWorkflowProviderPayload = {
+  type: "Custom";
+  contactId: string;
+  status: "pending";
+  conversationProviderId: string;
+  message?: string;
+  attachments?: string[];
+};
+
 export type GhlWorkflowOutboundMirrorInput = {
   requestId?: string;
   locationId: string;
@@ -21,6 +30,26 @@ export type GhlWorkflowOutboundMirrorInput = {
   workflowId?: string;
   lineMessageId?: string | null;
   existingGhlConversationId?: string | null;
+};
+
+export type GhlWorkflowProviderInput = {
+  requestId?: string;
+  locationId: string;
+  contactId: string;
+  conversationProviderId: string;
+  message?: string;
+  attachments?: string[];
+  workflowId?: string;
+  existingGhlConversationId?: string | null;
+};
+
+export type GhlWorkflowMessageStatus = "delivered" | "failed";
+
+export type GhlWorkflowMessageStatusResult = {
+  ok: boolean;
+  statusCode?: number;
+  authMode: GhlAuthContext["mode"] | "unknown";
+  errorCategory?: "upstream_rejected" | "request_failed";
 };
 
 export type GhlWorkflowOutboundMirrorResult = {
@@ -40,6 +69,28 @@ export type GhlWorkflowOutboundMirrorResult = {
 
 const endpoint = "/conversations/messages";
 const method = "POST";
+const maxProviderAttachments = 5;
+
+function buildProviderMessageLogContext(
+  input: GhlWorkflowProviderInput
+): Record<string, unknown> {
+  const attachmentCount = input.attachments?.length ?? 0;
+
+  return {
+    requestId: input.requestId,
+    selectedMessageType: attachmentCount > 0 ? "attachments" : "text",
+    messagePresent: hasLogValue(input.message),
+    messageLength: input.message?.length ?? 0,
+    attachmentCount,
+    locationIdPresent: hasLogValue(input.locationId),
+    locationRef: buildShortLogRef(input.locationId),
+    contactIdPresent: hasLogValue(input.contactId),
+    contactRef: buildShortLogRef(input.contactId),
+    workflowIdPresent: hasLogValue(input.workflowId),
+    existingConversationIdPresent: hasLogValue(input.existingGhlConversationId),
+    conversationProviderIdPresent: hasLogValue(input.conversationProviderId)
+  };
+}
 
 function buildMirrorLogContext(input: GhlWorkflowOutboundMirrorInput): Record<string, unknown> {
   return {
@@ -348,5 +399,206 @@ export async function mirrorWorkflowOutboundMessageToGhl(
       errorMessage,
       requestBody
     };
+  }
+}
+
+export async function createWorkflowProviderMessage(
+  input: GhlWorkflowProviderInput
+): Promise<GhlWorkflowOutboundMirrorResult> {
+  const messagePresent = typeof input.message === "string" && input.message.trim().length > 0;
+  const attachments = input.attachments ?? [];
+
+  if (input.message !== undefined && !messagePresent) {
+    throw new TypeError("HighLevel provider message must be non-empty when supplied");
+  }
+
+  if (attachments.length > maxProviderAttachments) {
+    throw new TypeError(`HighLevel provider message supports at most ${maxProviderAttachments} attachments`);
+  }
+
+  if (attachments.some((attachment) => typeof attachment !== "string" || attachment.length === 0)) {
+    throw new TypeError("HighLevel provider attachments must be non-empty strings");
+  }
+
+  if (!messagePresent && attachments.length === 0) {
+    throw new TypeError("HighLevel provider message requires text or at least one attachment");
+  }
+
+  const payload: GhlWorkflowProviderPayload = {
+    type: "Custom",
+    contactId: input.contactId,
+    status: "pending",
+    conversationProviderId: input.conversationProviderId,
+    ...(messagePresent ? { message: input.message } : {}),
+    ...(attachments.length > 0 ? { attachments } : {})
+  };
+  const safeRequestBody = {
+    type: payload.type,
+    contactIdPresent: true,
+    status: payload.status,
+    conversationProviderIdPresent: true,
+    messagePresent,
+    attachmentCount: attachments.length
+  };
+
+  logger.info(
+    {
+      endpoint,
+      method,
+      ...buildProviderMessageLogContext(input),
+      providerDispatchStatus: "preparing"
+    },
+    "Preparing HighLevel provider message dispatch"
+  );
+
+  try {
+    let auth = await getGhlAuthContext(input.locationId, { allowPrivateFallback: false });
+    let response = await performGhlRequest(
+      endpoint,
+      { method, headers: { Version: "v3" }, body: JSON.stringify(payload) },
+      auth
+    );
+
+    if (response.status === 401 && auth.mode === "oauth") {
+      await response.body?.cancel().catch(() => undefined);
+      auth = await forceRefreshGhlAuthContext(input.locationId);
+      response = await performGhlRequest(
+        endpoint,
+        { method, headers: { Version: "v3" }, body: JSON.stringify(payload) },
+        auth
+      );
+    }
+
+    const parsed = await readGhlResponse(response);
+
+    logger.info(
+      {
+        endpoint,
+        method,
+        authMode: auth.mode,
+        ...buildProviderMessageLogContext(input),
+        ghlConversationIdPresent: hasLogValue(parsed.ghlConversationId),
+        ghlMessageIdPresent: hasLogValue(parsed.ghlMessageId),
+        providerDispatchStatus: response.ok ? "success" : "failed",
+        statusCode: response.status,
+        canonicalCode: parsed.canonicalCode
+      },
+      "HighLevel provider message dispatch completed"
+    );
+
+    return {
+      ok: response.ok,
+      endpoint,
+      method,
+      authMode: auth.mode,
+      statusCode: response.status,
+      canonicalCode: parsed.canonicalCode,
+      message: parsed.message,
+      responseBody: {
+        ghlMessageIdPresent: hasLogValue(parsed.ghlMessageId),
+        ghlConversationIdPresent: hasLogValue(parsed.ghlConversationId)
+      },
+      errorMessage: response.ok
+        ? undefined
+        : `HighLevel provider message dispatch was rejected with status ${response.status}`,
+      requestBody: safeRequestBody,
+      ghlMessageId: parsed.ghlMessageId,
+      ghlConversationId: parsed.ghlConversationId
+    };
+  } catch (error) {
+    logger.error(
+      {
+        endpoint,
+        method,
+        ...buildProviderMessageLogContext(input),
+        providerDispatchStatus: "failed_before_response",
+        errorPresent: true,
+        errorCategory: error instanceof Error ? error.name : "unknown"
+      },
+      "HighLevel provider message dispatch failed before receiving a response"
+    );
+
+    return {
+      ok: false,
+      endpoint,
+      method,
+      authMode: "unknown",
+      errorMessage: "HighLevel provider message dispatch failed before receiving a response",
+      requestBody: safeRequestBody
+    };
+  }
+}
+
+export async function updateWorkflowProviderMessageStatus(input: {
+  requestId?: string;
+  locationId: string;
+  messageId: string;
+  status: GhlWorkflowMessageStatus;
+}): Promise<GhlWorkflowMessageStatusResult> {
+  const statusEndpoint = `${endpoint}/${encodeURIComponent(input.messageId)}/status`;
+
+  try {
+    let auth = await getGhlAuthContext(input.locationId, { allowPrivateFallback: false });
+    let response = await performGhlRequest(
+      statusEndpoint,
+      {
+        method: "PUT",
+        headers: { Version: "v3" },
+        body: JSON.stringify({ status: input.status })
+      },
+      auth
+    );
+
+    if (response.status === 401 && auth.mode === "oauth") {
+      await response.body?.cancel().catch(() => undefined);
+      auth = await forceRefreshGhlAuthContext(input.locationId);
+      response = await performGhlRequest(
+        statusEndpoint,
+        {
+          method: "PUT",
+          headers: { Version: "v3" },
+          body: JSON.stringify({ status: input.status })
+        },
+        auth
+      );
+    }
+
+    await response.body?.cancel().catch(() => undefined);
+
+    logger.info(
+      {
+        requestId: input.requestId,
+        locationIdPresent: hasLogValue(input.locationId),
+        locationRef: buildShortLogRef(input.locationId),
+        ghlMessageIdPresent: true,
+        requestedStatus: input.status,
+        statusCode: response.status,
+        statusUpdateStatus: response.ok ? "success" : "failed"
+      },
+      "HighLevel provider message status update completed"
+    );
+
+    return {
+      ok: response.ok,
+      statusCode: response.status,
+      authMode: auth.mode,
+      ...(response.ok ? {} : { errorCategory: "upstream_rejected" as const })
+    };
+  } catch (error) {
+    logger.error(
+      {
+        requestId: input.requestId,
+        locationIdPresent: hasLogValue(input.locationId),
+        locationRef: buildShortLogRef(input.locationId),
+        ghlMessageIdPresent: true,
+        requestedStatus: input.status,
+        statusUpdateStatus: "failed_before_response",
+        errorPresent: true,
+        errorCategory: error instanceof Error ? error.name : "unknown"
+      },
+      "HighLevel provider message status update failed before receiving a response"
+    );
+
+    return { ok: false, authMode: "unknown", errorCategory: "request_failed" };
   }
 }

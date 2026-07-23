@@ -54,6 +54,7 @@ const envSchema = z.object({
     .default("false")
     .transform((value) => value === "true"),
   GHL_WORKFLOW_LINE_DELIVERY_MODE: z.enum(["direct_legacy", "provider_first"]).default("direct_legacy"),
+  GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST: z.string().default(""),
   GHL_LINE_USER_ID_FIELD_ID: z.string().default(""),
   GHL_LINE_DISPLAY_NAME_FIELD_ID: z.string().default(""),
 
@@ -99,6 +100,7 @@ export const optionalEnvCheckKeys = [
   "GHL_LOCATION_API_AUTH_MODE",
   "GHL_WORKFLOW_OUTBOUND_MIRROR_ENABLED",
   "GHL_WORKFLOW_LINE_DELIVERY_MODE",
+  "GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST",
   "GHL_LINE_USER_ID_FIELD_ID",
   "GHL_LINE_DISPLAY_NAME_FIELD_ID",
   "CUSTOM_PAGE_FRAME_ANCESTORS"
@@ -133,4 +135,19 @@ export function requireEnvValue(key: string, value: string): string {
   }
 
   return value;
+}
+
+export function getWorkflowProviderFirstV3TenantRollout(tenantId: string): {
+  allowlistConfigured: boolean;
+  tenantAllowlisted: boolean;
+} {
+  const tenantIds = env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0 && value !== "*");
+
+  return {
+    allowlistConfigured: tenantIds.length > 0,
+    tenantAllowlisted: tenantIds.some((value) => value === tenantId)
+  };
 }

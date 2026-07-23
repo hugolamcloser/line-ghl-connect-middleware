@@ -267,7 +267,7 @@ function isNonPublicIpv6(address: string): boolean {
   return isUnspecified || isLoopback || isUniqueLocal || isLinkLocal || isMulticast;
 }
 
-function validatePublicHttpsUrl(
+export function validatePublicHttpsUrl(
   value: unknown,
   fieldName: "originalImageUrl" | "previewImageUrl" | "Attachment URL"
 ): { url: string; hostname: string } {
@@ -521,7 +521,7 @@ function truncateAttachmentDisplayName(value: string): string {
   return `${Array.from(baseName).slice(0, Math.max(baseLimit, 0)).join("")}${extension}`;
 }
 
-function getAttachmentDisplayName(name: string | undefined, category: WorkflowAttachmentCategory): string {
+export function getAttachmentDisplayName(name: string | undefined, category: WorkflowAttachmentCategory): string {
   const fallbackByCategory: Record<WorkflowAttachmentCategory, string> = {
     native_image: "圖片附件",
     image_link: "圖片附件",
