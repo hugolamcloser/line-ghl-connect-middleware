@@ -1,6 +1,17 @@
-# Provider-first v3 tenant canary rollout
+# Provider-first v3 rollout
 
-`GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST` is a comma-separated list of exact internal tenant IDs. Entries are trimmed, empty entries are ignored, and matching is case-sensitive. A missing or blank value enables no v3 tenants. A different-case value does not match, and `*` never enables all tenants.
+`GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED` defaults to `false`. When it is `true` and `GHL_WORKFLOW_LINE_DELIVERY_MODE=provider_first`, every otherwise eligible tenant selects the v3 lifecycle unless that exact internal tenant ID is denylisted.
+
+`GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST` remains a comma-separated list of exact internal tenant IDs for controlled overrides while global mode is false. `GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_DENYLIST` is also a comma-separated exact-ID list and overrides both global mode and an allowlist match. Entries are trimmed, empty entries are ignored, matching is case-sensitive, and `*` never matches a tenant or enables global behavior.
+
+The shared selection order is:
+
+1. `direct_legacy` selects the direct legacy lifecycle.
+2. A denylisted tenant selects the provider-first legacy lifecycle.
+3. Global mode or an exact allowlist match selects provider-first v3.
+4. Otherwise provider-first legacy remains selected.
+
+Lifecycle selection does not replace eligibility checks. Exact tenant/location ownership, a configured provider, a usable OAuth installation, mapping and active LINE channel resolution, callback provider validation, valid HighLevel message identity, and the atomic claim remain fail-closed requirements in their existing delivery paths.
 
 The allowlist is evaluated when the Workflow Action runs and again when its provider callback is processed. Do not add or remove an active tenant while callbacks from earlier outbound messages may still be in flight. A post-create audit row cannot safely pin the lifecycle because a callback may arrive before that row is stored, and a successful HighLevel create intentionally remains successful if audit persistence fails.
 
@@ -26,9 +37,15 @@ Use a fresh, dedicated tenant with no earlier outbound provider messages. Produc
 3. Remove the tenant from the allowlist once.
 4. Wait until only one Railway deployment and effective configuration is active before resuming normal sends.
 
-## Emergency service-wide rollback
+## Rollback
 
-If the provider-first lifecycle must be disabled for the entire service, use both settings together:
+The immediate feature rollback is:
+
+```text
+GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED=false
+```
+
+This restores the exact-allowlist rollout. If the provider-first lifecycle must be disabled for the entire service, use both settings together:
 
 ```text
 GHL_WORKFLOW_LINE_DELIVERY_MODE=direct_legacy

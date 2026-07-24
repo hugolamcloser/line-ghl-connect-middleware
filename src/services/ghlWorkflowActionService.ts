@@ -1275,14 +1275,7 @@ export async function processGhlWorkflowSendLine(
   }
 
   const rollout = getWorkflowProviderFirstV3TenantRollout(mapping.tenant_id);
-  const useProviderFirstV3 =
-    env.GHL_WORKFLOW_LINE_DELIVERY_MODE === "provider_first" && rollout.tenantAllowlisted;
-  const selectedLifecycle =
-    env.GHL_WORKFLOW_LINE_DELIVERY_MODE === "direct_legacy"
-      ? "direct_legacy"
-      : useProviderFirstV3
-        ? "provider_first_v3"
-        : "provider_first_legacy";
+  const useProviderFirstV3 = rollout.tenantV3Enabled;
 
   logger.info(
     {
@@ -1294,10 +1287,14 @@ export async function processGhlWorkflowSendLine(
         mapping
       }),
       rolloutMode: env.GHL_WORKFLOW_LINE_DELIVERY_MODE,
+      globalEnabled: rollout.globalEnabled,
       allowlistConfigured: rollout.allowlistConfigured,
-      tenantAllowlistMatch: rollout.tenantAllowlisted,
+      denylistConfigured: rollout.denylistConfigured,
+      tenantAllowlisted: rollout.tenantAllowlisted,
+      tenantDenylisted: rollout.tenantDenylisted,
+      tenantV3Enabled: rollout.tenantV3Enabled,
       tenantRef: buildShortLogRef(mapping.tenant_id),
-      selectedLifecycle
+      selectedLifecycle: rollout.selectedLifecycle
     },
     "Selected GHL workflow LINE delivery lifecycle"
   );

@@ -937,8 +937,7 @@ export async function processGhlOutboundWebhook(payload: Record<string, unknown>
   }
 
   const rollout = getWorkflowProviderFirstV3TenantRollout(mapping.tenant_id);
-  const useProviderFirstV3 =
-    env.GHL_WORKFLOW_LINE_DELIVERY_MODE === "provider_first" && rollout.tenantAllowlisted;
+  const useProviderFirstV3 = rollout.tenantV3Enabled;
 
   logger.info(
     {
@@ -947,10 +946,14 @@ export async function processGhlOutboundWebhook(payload: Record<string, unknown>
         tenantCount: tenantIds.length
       }),
       rolloutMode: env.GHL_WORKFLOW_LINE_DELIVERY_MODE,
+      globalEnabled: rollout.globalEnabled,
       allowlistConfigured: rollout.allowlistConfigured,
-      tenantAllowlistMatch: rollout.tenantAllowlisted,
+      denylistConfigured: rollout.denylistConfigured,
+      tenantAllowlisted: rollout.tenantAllowlisted,
+      tenantDenylisted: rollout.tenantDenylisted,
+      tenantV3Enabled: rollout.tenantV3Enabled,
       tenantRef: buildShortLogRef(mapping.tenant_id),
-      selectedLifecycle: useProviderFirstV3 ? "provider_first_v3" : "provider_first_legacy"
+      selectedLifecycle: rollout.selectedLifecycle
     },
     "Selected HighLevel provider callback lifecycle"
   );

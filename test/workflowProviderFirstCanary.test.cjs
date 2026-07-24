@@ -6,7 +6,9 @@ process.env.LOG_LEVEL = "silent";
 process.env.SUPABASE_URL = "https://example.supabase.co";
 process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-role";
 process.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "provider_first";
+process.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED = "false";
 process.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST = "";
+process.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_DENYLIST = "";
 
 const config = require("../dist/config/env");
 const loggerModule = require("../dist/config/logger");
@@ -38,14 +40,18 @@ const patchedExports = [
 ];
 const originals = patchedExports.map(([module, key]) => [module, key, module[key]]);
 const originalMode = config.env.GHL_WORKFLOW_LINE_DELIVERY_MODE;
+const originalGlobalEnabled = config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED;
 const originalAllowlist = config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST;
+const originalDenylist = config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_DENYLIST;
 
 afterEach(() => {
   for (const [module, key, value] of originals) {
     module[key] = value;
   }
   config.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = originalMode;
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED = originalGlobalEnabled;
   config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST = originalAllowlist;
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_DENYLIST = originalDenylist;
 });
 
 function textPayload(overrides = {}) {
@@ -194,9 +200,162 @@ test("the exact resolved tenant enables the v3 text lifecycle", async () => {
   const serializedLogs = JSON.stringify(calls.logs);
   assert.doesNotMatch(serializedLogs, /tenant-canary/);
   assert.doesNotMatch(serializedLogs, /tenant-other/);
+  assert.match(serializedLogs, /globalEnabled/);
   assert.match(serializedLogs, /allowlistConfigured/);
-  assert.match(serializedLogs, /tenantAllowlistMatch/);
+  assert.match(serializedLogs, /denylistConfigured/);
+  assert.match(serializedLogs, /tenantAllowlisted/);
+  assert.match(serializedLogs, /tenantDenylisted/);
+  assert.match(serializedLogs, /tenantV3Enabled/);
   assert.match(serializedLogs, /provider_first_v3/);
+});
+
+test("global mode selects the same v3 lifecycle for workflow and provider callback", async () => {
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED = true;
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST = "tenant-other";
+  const workflowCalls = setupWorkflowHarness();
+
+  const workflowResult = await workflowService.processGhlWorkflowSendLine(textPayload());
+
+  assert.equal(workflowResult.body.status, "sent");
+  assert.equal(workflowCalls.v3Creates.length, 1);
+  assert.equal(workflowCalls.legacyCreates.length, 0);
+
+  const callbackCalls = { claims: 0, pushes: 0, finalizations: 0, updates: 0 };
+  repository.getTenantIdsByLocationId = async () => ["tenant-canary"];
+  repository.findWorkflowOutboundMirrorMessageEventForTenantIds = async () => null;
+  repository.findWorkflowProviderDispatchMessageEvent = async () => null;
+  repository.findLineProfileByGhlIdsForTenantIds = async () => ({
+    id: "profile-canary",
+    tenant_id: "tenant-canary",
+    line_user_id: "line-user-canary",
+    line_channel_id: "line-channel-canary",
+    ghl_contact_id: "contact-canary",
+    ghl_conversation_id: "conversation-canary"
+  });
+  repository.getTenantById = async () => ({
+    id: "tenant-canary",
+    location_id: "location-canary",
+    ghl_provider_id: "provider-canary"
+  });
+  repository.claimGhlOutboundProviderDelivery = async (input) => {
+    callbackCalls.claims += 1;
+    return {
+      claimed: true,
+      eventId: "global-claim-canary",
+      externalMessageId: `claim:${input.ghlMessageId}`
+    };
+  };
+  repository.finalizeGhlOutboundProviderDelivery = async () => {
+    callbackCalls.finalizations += 1;
+  };
+  channelService.resolveLineChannelForOutbound = async () => ({
+    channelAccessToken: "line-token-canary",
+    lineChannelId: "line-channel-canary",
+    channelTokenSource: "profile_channel"
+  });
+  lineClient.pushLineMessages = async () => {
+    callbackCalls.pushes += 1;
+    return { messageId: "global-line-canary", statusCode: 200 };
+  };
+  outboundClient.updateWorkflowProviderMessageStatus = async () => {
+    callbackCalls.updates += 1;
+    return { ok: true, statusCode: 200, authMode: "oauth" };
+  };
+
+  const callbackResult = await syncService.processGhlOutboundWebhook({
+    locationId: "location-canary",
+    contactId: "contact-canary",
+    conversationId: "conversation-canary",
+    messageId: "global-message-canary",
+    conversationProviderId: "provider-canary",
+    message: "safe global callback text"
+  });
+
+  assert.deepEqual(callbackResult, { status: "processed" });
+  assert.equal(callbackCalls.claims, 1);
+  assert.equal(callbackCalls.pushes, 1);
+  assert.equal(callbackCalls.finalizations, 1);
+  assert.equal(callbackCalls.updates, 1);
+  assert.equal(workflowCalls.textPushes.length, 0);
+});
+
+test("global mode preserves exact provider validation", async () => {
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED = true;
+  const calls = { claims: 0, pushes: 0 };
+  repository.getTenantIdsByLocationId = async () => ["tenant-canary"];
+  repository.findWorkflowOutboundMirrorMessageEventForTenantIds = async () => null;
+  repository.findLineProfileByGhlIdsForTenantIds = async () => ({
+    id: "profile-canary",
+    tenant_id: "tenant-canary",
+    line_user_id: "line-user-canary",
+    line_channel_id: "line-channel-canary",
+    ghl_contact_id: "contact-canary",
+    ghl_conversation_id: "conversation-canary"
+  });
+  repository.getTenantById = async () => ({
+    id: "tenant-canary",
+    location_id: "location-canary",
+    ghl_provider_id: "provider-canary"
+  });
+  repository.claimGhlOutboundProviderDelivery = async () => {
+    calls.claims += 1;
+    throw new Error("claim must not be attempted");
+  };
+  lineClient.pushLineMessages = async () => {
+    calls.pushes += 1;
+    throw new Error("LINE must not be attempted");
+  };
+
+  const result = await syncService.processGhlOutboundWebhook({
+    locationId: "location-canary",
+    contactId: "contact-canary",
+    conversationId: "conversation-canary",
+    messageId: "provider-mismatch-message",
+    conversationProviderId: "provider-other",
+    message: "must remain blocked"
+  });
+
+  assert.deepEqual(result, {
+    status: "skipped",
+    reason: "Conversation provider validation failed"
+  });
+  assert.equal(calls.claims, 0);
+  assert.equal(calls.pushes, 0);
+});
+
+test("global mode remains fail closed without a mapping", async () => {
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED = true;
+  const calls = setupWorkflowHarness();
+  repository.findLineProfileByGhlIdsForTenantIds = async () => null;
+
+  const result = await workflowService.processGhlWorkflowSendLine(textPayload());
+
+  assert.equal(result.body.status, "skipped");
+  assert.equal(calls.v3Creates.length, 0);
+  assert.equal(calls.legacyCreates.length, 0);
+  assert.equal(calls.textPushes.length, 0);
+  assert.equal(calls.linePlans.length, 0);
+});
+
+test("global mode remains fail closed without an active LINE channel", async () => {
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED = true;
+  const calls = setupWorkflowHarness();
+  channelService.resolveLineChannelForOutbound = async () => {
+    throw new channelService.LineChannelNotConnectedError({
+      lineChannelId: "line-channel-canary",
+      channelTokenSource: "profile_channel"
+    });
+  };
+
+  const result = await workflowService.processGhlWorkflowSendLine(textPayload());
+
+  assert.equal(result.httpStatus, 409);
+  assert.equal(result.body.status, "failed");
+  assert.match(result.body.error, /not connected/);
+  assert.equal(calls.v3Creates.length, 0);
+  assert.equal(calls.legacyCreates.length, 0);
+  assert.equal(calls.textPushes.length, 0);
+  assert.equal(calls.linePlans.length, 0);
 });
 
 test("allowlisted attachments use v3 while non-allowlisted attachments preserve direct Phase 2 delivery", async () => {
@@ -233,8 +392,8 @@ test("direct_legacy remains direct regardless of an exact canary match", async (
   assert.equal(calls.v3Creates.length, 0);
 });
 
-test("an allowlisted mapping whose tenant belongs to another location fails closed", async () => {
-  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST = "tenant-canary";
+test("a globally selected mapping whose tenant belongs to another location fails closed", async () => {
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED = true;
   const calls = setupWorkflowHarness();
   repository.getTenantById = async () => ({
     id: "tenant-canary",
@@ -330,9 +489,10 @@ test("a non-allowlisted provider callback retains the pre-PR58 text lifecycle", 
   assert.equal(calls.updates, 0);
 });
 
-test("allowlisted concurrent callbacks retain one atomic claim and one LINE delivery", async () => {
+test("globally selected concurrent callbacks retain one atomic claim and one LINE delivery", async () => {
   config.env.GHL_WORKFLOW_LINE_DELIVERY_MODE = "provider_first";
-  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST = "tenant-canary";
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED = true;
+  config.env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST = "tenant-other";
   const claims = new Set();
   const calls = { claims: 0, pushes: 0, finalizations: 0, updates: 0 };
 
