@@ -54,7 +54,12 @@ const envSchema = z.object({
     .default("false")
     .transform((value) => value === "true"),
   GHL_WORKFLOW_LINE_DELIVERY_MODE: z.enum(["direct_legacy", "provider_first"]).default("direct_legacy"),
+  GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST: z.string().default(""),
+  GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_DENYLIST: z.string().default(""),
   GHL_LINE_USER_ID_FIELD_ID: z.string().default(""),
   GHL_LINE_DISPLAY_NAME_FIELD_ID: z.string().default(""),
 
@@ -100,7 +105,9 @@ export const optionalEnvCheckKeys = [
   "GHL_LOCATION_API_AUTH_MODE",
   "GHL_WORKFLOW_OUTBOUND_MIRROR_ENABLED",
   "GHL_WORKFLOW_LINE_DELIVERY_MODE",
+  "GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED",
   "GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST",
+  "GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_DENYLIST",
   "GHL_LINE_USER_ID_FIELD_ID",
   "GHL_LINE_DISPLAY_NAME_FIELD_ID",
   "CUSTOM_PAGE_FRAME_ANCESTORS"
@@ -137,17 +144,54 @@ export function requireEnvValue(key: string, value: string): string {
   return value;
 }
 
-export function getWorkflowProviderFirstV3TenantRollout(tenantId: string): {
-  allowlistConfigured: boolean;
-  tenantAllowlisted: boolean;
-} {
-  const tenantIds = env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST
+export type WorkflowProviderFirstV3Lifecycle =
+  | "direct_legacy"
+  | "provider_first_legacy"
+  | "provider_first_v3";
+
+function parseExactTenantIds(value: string): string[] {
+  return value
     .split(",")
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0 && value !== "*");
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0 && entry !== "*");
+}
+
+export function getWorkflowProviderFirstV3TenantRollout(tenantId: string): {
+  globalEnabled: boolean;
+  allowlistConfigured: boolean;
+  denylistConfigured: boolean;
+  tenantAllowlisted: boolean;
+  tenantDenylisted: boolean;
+  tenantV3Enabled: boolean;
+  selectedLifecycle: WorkflowProviderFirstV3Lifecycle;
+} {
+  const allowlistedTenantIds = parseExactTenantIds(
+    env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_ALLOWLIST
+  );
+  const denylistedTenantIds = parseExactTenantIds(
+    env.GHL_WORKFLOW_PROVIDER_FIRST_V3_TENANT_DENYLIST
+  );
+  const globalEnabled = env.GHL_WORKFLOW_PROVIDER_FIRST_V3_GLOBAL_ENABLED;
+  const tenantAllowlisted = allowlistedTenantIds.some((value) => value === tenantId);
+  const tenantDenylisted = denylistedTenantIds.some((value) => value === tenantId);
+  const tenantV3Enabled =
+    env.GHL_WORKFLOW_LINE_DELIVERY_MODE === "provider_first" &&
+    !tenantDenylisted &&
+    (globalEnabled || tenantAllowlisted);
+  const selectedLifecycle: WorkflowProviderFirstV3Lifecycle =
+    env.GHL_WORKFLOW_LINE_DELIVERY_MODE === "direct_legacy"
+      ? "direct_legacy"
+      : tenantV3Enabled
+        ? "provider_first_v3"
+        : "provider_first_legacy";
 
   return {
-    allowlistConfigured: tenantIds.length > 0,
-    tenantAllowlisted: tenantIds.some((value) => value === tenantId)
+    globalEnabled,
+    allowlistConfigured: allowlistedTenantIds.length > 0,
+    denylistConfigured: denylistedTenantIds.length > 0,
+    tenantAllowlisted,
+    tenantDenylisted,
+    tenantV3Enabled,
+    selectedLifecycle
   };
 }
